@@ -130,27 +130,12 @@ def test_utc_until(job_template, until, dtend):
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('until, dtend', [
-    ['20180602T170000', '2018-06-02 16:00:00+00:00'],
-    ['20180602T000000', '2018-06-01 16:00:00+00:00'],
+@pytest.mark.parametrize('dtstart, until', [
+    ['20180601T120000Z', '20180602T170000'],
+    ['TZID=America/New_York:20180601T120000', '20180602T170000'],
 ])
-def test_tzinfo_until(job_template, until, dtend):
-    rrule = 'DTSTART;TZID=America/New_York:20180601T120000 RRULE:FREQ=DAILY;INTERVAL=1;UNTIL={}'.format(until)  # noqa
-    s = Schedule(
-        name='Some Schedule',
-        rrule=rrule,
-        unified_job_template=job_template
-    )
-    s.save()
-
-    assert str(s.next_run) == '2018-06-01 16:00:00+00:00'  # UTC = +4 EST
-    assert str(s.next_run) == str(s.dtstart)
-    assert str(s.dtend) == dtend
-
-
-@pytest.mark.django_db
-def test_mismatched_until_timezone(job_template):
-    rrule = 'DTSTART;TZID=America/New_York:20180601T120000 RRULE:FREQ=DAILY;INTERVAL=1;UNTIL=20180602T000000' + 'Z'  # noqa the Z isn't allowed, because we have a TZID=America/New_York
+def test_tzinfo_naive_until(job_template, dtstart, until):
+    rrule = 'DTSTART;{} RRULE:FREQ=DAILY;INTERVAL=1;UNTIL={}'.format(dtstart, until)  # noqa
     s = Schedule(
         name='Some Schedule',
         rrule=rrule,
@@ -158,6 +143,19 @@ def test_mismatched_until_timezone(job_template):
     )
     with pytest.raises(ValueError):
         s.save()
+
+
+@pytest.mark.django_db
+def test_until_must_be_utc(job_template):
+    rrule = 'DTSTART;TZID=America/New_York:20180601T120000 RRULE:FREQ=DAILY;INTERVAL=1;UNTIL=20180602T000000'  # noqa the Z is required
+    s = Schedule(
+        name='Some Schedule',
+        rrule=rrule,
+        unified_job_template=job_template
+    )
+    with pytest.raises(ValueError) as e:
+        s.save()
+    assert 'RRULE UNTIL values must be specified in UTC' in str(e)
 
 
 @pytest.mark.django_db
@@ -192,3 +190,16 @@ def test_dst_phantom_hour(job_template):
 
     # 3/10/30 @ 2:30AM is skipped because it _doesn't exist_ <cue twilight zone music>
     assert str(s.next_run) == '2030-03-17 06:30:00+00:00'
+
+
+@pytest.mark.django_db
+def test_beginning_of_time(job_template):
+    # ensure that really large generators don't have performance issues
+    rrule = 'DTSTART:19700101T000000Z RRULE:FREQ=MINUTELY;INTERVAL=1'
+    s = Schedule(
+        name='Some Schedule',
+        rrule=rrule,
+        unified_job_template=job_template
+    )
+    with pytest.raises(ValueError):
+        s.save()

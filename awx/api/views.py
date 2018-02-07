@@ -57,7 +57,7 @@ import pytz
 from wsgiref.util import FileWrapper
 
 # AWX
-from awx.main.tasks import send_notifications
+from awx.main.tasks import send_notifications, handle_ha_toplogy_changes
 from awx.main.access import get_user_queryset
 from awx.main.ha import is_ha_environment
 from awx.api.authentication import TokenGetAuthentication
@@ -148,15 +148,51 @@ class UnifiedJobDeletionMixin(object):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class InstanceGroupMembershipMixin(object):
+    '''
+    Manages signaling celery to reload its queue configuration on Instance Group membership changes
+    '''
+    def attach(self, request, *args, **kwargs):
+        response = super(InstanceGroupMembershipMixin, self).attach(request, *args, **kwargs)
+        sub_id, res = self.attach_validate(request)
+        if status.is_success(response.status_code):
+            if self.parent_model is Instance:
+                ig_obj = get_object_or_400(self.model, pk=sub_id)
+                inst_name = ig_obj.hostname
+            else:
+                ig_obj = self.get_parent_object()
+                inst_name = get_object_or_400(self.model, pk=sub_id).hostname
+            if inst_name not in ig_obj.policy_instance_list:
+                ig_obj.policy_instance_list.append(inst_name)
+                ig_obj.save()
+        return response
+
+    def unattach(self, request, *args, **kwargs):
+        response = super(InstanceGroupMembershipMixin, self).unattach(request, *args, **kwargs)
+        sub_id, res = self.attach_validate(request)
+        if status.is_success(response.status_code):
+            if self.parent_model is Instance:
+                ig_obj = get_object_or_400(self.model, pk=sub_id)
+                inst_name = self.get_parent_object().hostname
+            else:
+                ig_obj = self.get_parent_object()
+                inst_name = get_object_or_400(self.model, pk=sub_id).hostname
+            if inst_name in ig_obj.policy_instance_list:
+                ig_obj.policy_instance_list.pop(ig_obj.policy_instance_list.index(inst_name))
+                ig_obj.save()
+        return response
+
+
 class ApiRootView(APIView):
 
     authentication_classes = []
     permission_classes = (AllowAny,)
     view_name = _('REST API')
     versioning_class = None
+    swagger_topic = 'Versioning'
 
     def get(self, request, format=None):
-        ''' list supported API versions '''
+        ''' List supported API versions '''
 
         v1 = reverse('api:api_v1_root_view', kwargs={'version': 'v1'})
         v2 = reverse('api:api_v2_root_view', kwargs={'version': 'v2'})
@@ -175,9 +211,10 @@ class ApiVersionRootView(APIView):
 
     authentication_classes = []
     permission_classes = (AllowAny,)
+    swagger_topic = 'Versioning'
 
     def get(self, request, format=None):
-        ''' list top level resources '''
+        ''' List top level resources '''
         data = OrderedDict()
         data['authtoken'] = reverse('api:auth_token_view', request=request)
         data['ping'] = reverse('api:api_v1_ping_view', request=request)
@@ -240,9 +277,10 @@ class ApiV1PingView(APIView):
     authentication_classes = ()
     view_name = _('Ping')
     new_in_210 = True
+    swagger_topic = 'System Configuration'
 
     def get(self, request, format=None):
-        """Return some basic information about this instance.
+        """Return some basic information about this instance
 
         Everything returned here should be considered public / insecure, as
         this requires no auth and is intended for use by the installer process.
@@ -270,6 +308,7 @@ class ApiV1ConfigView(APIView):
 
     permission_classes = (IsAuthenticated,)
     view_name = _('Configuration')
+    swagger_topic = 'System Configuration'
 
     def check_permissions(self, request):
         super(ApiV1ConfigView, self).check_permissions(request)
@@ -277,7 +316,7 @@ class ApiV1ConfigView(APIView):
             self.permission_denied(request)  # Raises PermissionDenied exception.
 
     def get(self, request, format=None):
-        '''Return various sitewide configuration settings.'''
+        '''Return various sitewide configuration settings'''
 
         if request.user.is_superuser or request.user.is_system_auditor:
             license_data = get_license(show_key=True)
@@ -372,6 +411,7 @@ class DashboardView(APIView):
 
     view_name = _("Dashboard")
     new_in_14 = True
+    swagger_topic = 'Dashboard'
 
     def get(self, request, format=None):
         ''' Show Dashboard Details '''
@@ -471,6 +511,7 @@ class DashboardJobsGraphView(APIView):
 
     view_name = _("Dashboard Jobs Graphs")
     new_in_200 = True
+    swagger_topic = 'Jobs'
 
     def get(self, request, format=None):
         period = request.query_params.get('period', 'month')
@@ -525,12 +566,26 @@ class InstanceList(ListAPIView):
     new_in_320 = True
 
 
-class InstanceDetail(RetrieveAPIView):
+class InstanceDetail(RetrieveUpdateAPIView):
 
     view_name = _("Instance Detail")
     model = Instance
     serializer_class = InstanceSerializer
     new_in_320 = True
+
+
+    def update(self, request, *args, **kwargs):
+        r = super(InstanceDetail, self).update(request, *args, **kwargs)
+        if status.is_success(r.status_code):
+            obj = self.get_object()
+            if obj.enabled:
+                obj.refresh_capacity()
+            else:
+                obj.capacity = 0
+            obj.save()
+            handle_ha_toplogy_changes.apply_async()
+            r.data = InstanceSerializer(obj, context=self.get_serializer_context()).to_representation(obj)
+        return r
 
 
 class InstanceUnifiedJobsList(SubListAPIView):
@@ -548,7 +603,7 @@ class InstanceUnifiedJobsList(SubListAPIView):
         return qs
 
 
-class InstanceInstanceGroupsList(SubListAPIView):
+class InstanceInstanceGroupsList(InstanceGroupMembershipMixin, SubListCreateAttachDetachAPIView):
 
     view_name = _("Instance's Instance Groups")
     model = InstanceGroup
@@ -558,7 +613,7 @@ class InstanceInstanceGroupsList(SubListAPIView):
     relationship = 'rampart_groups'
 
 
-class InstanceGroupList(ListAPIView):
+class InstanceGroupList(ListCreateAPIView):
 
     view_name = _("Instance Groups")
     model = InstanceGroup
@@ -566,7 +621,7 @@ class InstanceGroupList(ListAPIView):
     new_in_320 = True
 
 
-class InstanceGroupDetail(RetrieveAPIView):
+class InstanceGroupDetail(RetrieveUpdateDestroyAPIView):
 
     view_name = _("Instance Group Detail")
     model = InstanceGroup
@@ -584,7 +639,7 @@ class InstanceGroupUnifiedJobsList(SubListAPIView):
     new_in_320 = True
 
 
-class InstanceGroupInstanceList(SubListAPIView):
+class InstanceGroupInstanceList(InstanceGroupMembershipMixin, SubListAttachDetachAPIView):
 
     view_name = _("Instance Group's Instances")
     model = Instance
@@ -640,6 +695,8 @@ class SchedulePreview(GenericAPIView):
 
 
 class ScheduleZoneInfo(APIView):
+
+    swagger_topic = 'System Configuration'
 
     def get(self, request):
         from dateutil.zoneinfo import get_zonefile_instance
@@ -697,10 +754,12 @@ class ScheduleUnifiedJobsList(SubListAPIView):
 
 
 class AuthView(APIView):
+    ''' List enabled single-sign-on endpoints '''
 
     authentication_classes = []
     permission_classes = (AllowAny,)
     new_in_240 = True
+    swagger_topic = 'System Configuration'
 
     def get(self, request):
         from rest_framework.reverse import reverse
@@ -744,6 +803,7 @@ class AuthTokenView(APIView):
     permission_classes = (AllowAny,)
     serializer_class = AuthTokenSerializer
     model = AuthToken
+    swagger_topic = 'Authentication'
 
     def get_serializer(self, *args, **kwargs):
         serializer = self.serializer_class(*args, **kwargs)
@@ -933,7 +993,7 @@ class OrganizationDetail(RetrieveUpdateDestroyAPIView):
     def get_serializer_context(self, *args, **kwargs):
         full_context = super(OrganizationDetail, self).get_serializer_context(*args, **kwargs)
 
-        if not hasattr(self, 'kwargs'):
+        if not hasattr(self, 'kwargs') or 'pk' not in self.kwargs:
             return full_context
         org_id = int(self.kwargs['pk'])
 
@@ -2246,7 +2306,7 @@ class HostInsights(GenericAPIView):
         except requests.exceptions.Timeout:
             return (dict(error=_('Request to {} timed out.').format(url)), status.HTTP_504_GATEWAY_TIMEOUT)
         except requests.exceptions.RequestException as e:
-            return (dict(error=_('Unkown exception {} while trying to GET {}').format(e, url)), status.HTTP_502_BAD_GATEWAY)
+            return (dict(error=_('Unknown exception {} while trying to GET {}').format(e, url)), status.HTTP_502_BAD_GATEWAY)
 
         if res.status_code == 401:
             return (dict(error=_('Unauthorized access. Please check your Insights Credential username and password.')), status.HTTP_502_BAD_GATEWAY)
@@ -2631,7 +2691,7 @@ class InventorySourceList(ListCreateAPIView):
     @property
     def allowed_methods(self):
         methods = super(InventorySourceList, self).allowed_methods
-        if get_request_version(self.request) == 1:
+        if get_request_version(getattr(self, 'request', None)) == 1:
             methods.remove('POST')
         return methods
 
@@ -3945,7 +4005,7 @@ class JobList(ListCreateAPIView):
     @property
     def allowed_methods(self):
         methods = super(JobList, self).allowed_methods
-        if get_request_version(self.request) > 1:
+        if get_request_version(getattr(self, 'request', None)) > 1:
             methods.remove('POST')
         return methods
 
@@ -4721,6 +4781,7 @@ class NotificationTemplateDetail(RetrieveUpdateDestroyAPIView):
 
 
 class NotificationTemplateTest(GenericAPIView):
+    '''Test a Notification Template'''
 
     view_name = _('Notification Template Test')
     model = NotificationTemplate

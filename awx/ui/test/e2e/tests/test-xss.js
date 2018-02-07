@@ -1,5 +1,6 @@
 import {
     getAdminMachineCredential,
+    getHost,
     getInventory,
     getInventoryScript,
     getInventorySource,
@@ -12,6 +13,7 @@ import {
     getSmartInventory,
     getTeam,
     getUpdatedProject,
+    getJob,
 } from '../fixtures';
 
 const data = {};
@@ -21,9 +23,11 @@ const pages = {};
 module.exports = {
     before: (client, done) => {
         const namespace = '<div id="xss" class="xss">test</div>';
+        const namespaceShort = '<div class="xss">t</div>';
 
         const resources = [
             getOrganization(namespace).then(obj => { data.organization = obj; }),
+            getHost(namespaceShort).then(obj => { data.host = obj; }),
             getInventory(namespace).then(obj => { data.inventory = obj; }),
             getInventoryScript(namespace).then(obj => { data.inventoryScript = obj; }),
             getSmartInventory(namespace).then(obj => { data.smartInventory = obj; }),
@@ -36,6 +40,7 @@ module.exports = {
             getTeam(namespace).then(obj => { data.team = obj; }),
             getJobTemplateAdmin(namespace).then(obj => { data.user = obj; }),
             getNotificationTemplate(namespace).then(obj => { data.notification = obj; }),
+            getJob(namespaceShort).then(obj => { data.job = obj; }),
         ];
 
         Promise.all(resources)
@@ -43,15 +48,18 @@ module.exports = {
                 pages.organizations = client.page.organizations();
                 pages.inventories = client.page.inventories();
                 pages.inventoryScripts = client.page.inventoryScripts();
+                pages.hosts = client.page.hosts();
                 pages.projects = client.page.projects();
                 pages.credentials = client.page.credentials();
                 pages.templates = client.page.templates();
                 pages.teams = client.page.teams();
                 pages.users = client.page.users();
                 pages.notificationTemplates = client.page.notificationTemplates();
+                pages.jobs = client.page.jobs();
 
                 urls.organization = `${pages.organizations.url()}/${data.organization.id}`;
                 urls.inventory = `${pages.inventories.url()}/inventory/${data.inventory.id}`;
+                urls.hosts = `${pages.hosts.url()}`;
                 urls.inventoryScript = `${pages.inventoryScripts.url()}/${data.inventoryScript.id}`;
                 urls.inventorySource = `${urls.inventory}/inventory_sources/edit/${data.inventorySource.id}`;
                 urls.sourceSchedule = `${urls.inventorySource}/schedules/${data.sourceSchedule.id}`;
@@ -63,6 +71,8 @@ module.exports = {
                 urls.team = `${pages.teams.url()}/${data.team.id}`;
                 urls.user = `${pages.users.url()}/${data.user.id}`;
                 urls.notification = `${pages.notificationTemplates.url()}/${data.notification.id}`;
+                urls.jobs = `${pages.jobs.url()}`;
+                urls.jobsSchedules = `${pages.jobs.url()}/schedules`;
 
                 client.useCss();
                 client.login();
@@ -655,6 +665,40 @@ module.exports = {
         client.navigateTo(urls.jobTemplateSchedule);
         client.expect.element('#xss').not.present;
         client.expect.element('[class=xss]').not.present;
+    },
+    'check job schedules view for unsanitized content': client => {
+        const itemRow = `#schedules_table tr[id="${data.jobTemplateSchedule.id}"]`;
+        const itemName = `${itemRow} td[class*="name-"] a`;
+
+        client.navigateTo(urls.jobsSchedules);
+
+        client.moveToElement(itemName, 0, 0, () => {
+            client.expect.element(itemName).attribute('aria-describedby');
+            client.getAttribute(itemName, 'aria-describedby', ({ value }) => {
+                const tooltip = `#${value}`;
+                client.expect.element(tooltip).present;
+                client.expect.element(tooltip).visible;
+
+                client.expect.element('#xss').not.present;
+                client.expect.element('[class=xss]').not.present;
+                client.expect.element(tooltip).attribute('innerHTML')
+                    .contains('&lt;div id="xss" class="xss"&gt;test&lt;/div&gt;');
+            });
+        });
+        client.end();
+    },
+    'check host recent jobs popup for unsanitized content': client => {
+        const itemRow = `#hosts_table tr[id="${data.host.id}"]`;
+        const itemName = `${itemRow} td[class*="active_failures-"] a`;
+        const popOver = `${itemRow} td[class*="active_failures-"] div[class*="popover"]`;
+
+        client.navigateTo(urls.hosts);
+
+        client.click(itemName);
+        client.expect.element(popOver).present;
+
+        client.expect.element('[class=xss]').not.present;
+
         client.end();
     },
 };

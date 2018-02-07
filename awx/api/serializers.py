@@ -3927,8 +3927,8 @@ class SchedulePreviewSerializer(BaseSerializer):
                 raise serializers.ValidationError(_("COUNT > 999 is unsupported."))
         try:
             Schedule.rrulestr(rrule_value)
-        except Exception:
-            raise serializers.ValidationError(_("rrule parsing failed validation."))
+        except Exception as e:
+            raise serializers.ValidationError(_("rrule parsing failed validation: {}").format(e))
         return value
 
 
@@ -3946,6 +3946,15 @@ class ScheduleSerializer(LaunchConfigurationBaseSerializer, SchedulePreviewSeria
         ))
         if obj.unified_job_template:
             res['unified_job_template'] = obj.unified_job_template.get_absolute_url(self.context.get('request'))
+            try:
+                if obj.unified_job_template.project:
+                    res['project'] = obj.unified_job_template.project.get_absolute_url(self.context.get('request'))
+            except ObjectDoesNotExist:
+                pass
+        if obj.inventory:
+            res['inventory'] = obj.inventory.get_absolute_url(self.context.get('request'))
+        elif obj.unified_job_template and getattr(obj.unified_job_template, 'inventory', None):
+            res['inventory'] = obj.unified_job_template.inventory.get_absolute_url(self.context.get('request'))
         return res
 
     def validate_unified_job_template(self, value):
@@ -3968,8 +3977,10 @@ class InstanceSerializer(BaseSerializer):
 
     class Meta:
         model = Instance
-        fields = ("id", "type", "url", "related", "uuid", "hostname", "created", "modified",
-                  "version", "capacity", "consumed_capacity", "percent_capacity_remaining", "jobs_running")
+        read_only_fields = ('uuid', 'hostname', 'version')
+        fields = ("id", "type", "url", "related", "uuid", "hostname", "created", "modified", 'capacity_adjustment',
+                  "version", "capacity", "consumed_capacity", "percent_capacity_remaining", "jobs_running",
+                  "cpu", "memory", "cpu_capacity", "mem_capacity", "enabled")
 
     def get_related(self, obj):
         res = super(InstanceSerializer, self).get_related(obj)
@@ -4002,7 +4013,8 @@ class InstanceGroupSerializer(BaseSerializer):
         model = InstanceGroup
         fields = ("id", "type", "url", "related", "name", "created", "modified",
                   "capacity", "committed_capacity", "consumed_capacity",
-                  "percent_capacity_remaining", "jobs_running", "instances", "controller")
+                  "percent_capacity_remaining", "jobs_running", "instances", "controller",
+                  "policy_instance_percentage", "policy_instance_minimum", "policy_instance_list")
 
     def get_related(self, obj):
         res = super(InstanceGroupSerializer, self).get_related(obj)
