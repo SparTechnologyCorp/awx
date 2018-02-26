@@ -49,13 +49,17 @@ module.exports = {
     'create project': client => {
         const projects = client.page.projects();
 
-        projects.navigate();
+        projects.section.navigation.waitForElementVisible('@projects');
+        projects.section.navigation.expect.element('@projects').enabled;
+        projects.section.navigation.click('@projects');
+
         projects.waitForElementVisible('div.spinny');
         projects.waitForElementNotVisible('div.spinny');
 
         projects.section.list.waitForElementVisible('@add');
         projects.section.list.expect.element('@add').enabled;
-        projects.section.list.click('@add');
+
+        client.pause(1000); projects.section.list.click('@add');
 
         projects.waitForElementVisible('label[for="name"] + div input');
         projects.waitForElementVisible('label[for="organization"] + div input');
@@ -236,7 +240,10 @@ module.exports = {
     'create job template': client => {
         const templates = client.page.templates();
 
-        templates.navigate();
+        templates.section.navigation.waitForElementVisible('@templates');
+        templates.section.navigation.expect.element('@templates').enabled;
+        templates.section.navigation.click('@templates');
+
         templates.waitForElementVisible('div.spinny');
         templates.waitForElementNotVisible('div.spinny');
 
@@ -263,6 +270,7 @@ module.exports = {
         templates.waitForElementVisible('smart-search input');
         templates.expect.element('smart-search input').enabled;
 
+        client.pause(1000).waitForElementNotVisible('div.spinny');
         templates.sendKeys('smart-search input', `${TEMPLATE_NAME}${client.Keys.ENTER}`);
         templates.waitForElementVisible('div.spinny');
         templates.waitForElementNotVisible('div.spinny');

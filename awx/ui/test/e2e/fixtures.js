@@ -3,36 +3,24 @@ import uuid from 'uuid';
 import { AWX_E2E_PASSWORD } from './settings';
 
 import {
-    all,
     get,
     post,
-    spread
 } from './api';
 
 const session = `e2e-${uuid().substr(0, 8)}`;
-
 const store = {};
 
-const getOrCreate = (endpoint, data) => {
-    const identifier = Object.keys(data).find(key => ['name', 'username'].includes(key));
+const getOrCreate = (endpoint, data, unique = ['name']) => {
+    const identifiers = Object.keys(data).filter(key => unique.indexOf(key) > -1);
 
-    if (identifier === undefined) {
+    if (identifiers.length < 1) {
         throw new Error('A unique key value must be provided.');
     }
 
-    const identity = data[identifier];
+    const lookup = `${endpoint}/${identifiers.map(key => data[key]).join('-')}`;
+    const params = Object.assign(...identifiers.map(key => ({ [key]: data[key] })));
 
-    if (store[endpoint] && store[endpoint][identity]) {
-        return store[endpoint][identity].then(created => created.data);
-    }
-
-    if (!store[endpoint]) {
-        store[endpoint] = {};
-    }
-
-    const query = { params: { [identifier]: identity } };
-
-    store[endpoint][identity] = get(endpoint, query)
+    store[lookup] = store[lookup] || get(endpoint, { params })
         .then(res => {
             if (res.data.results.length > 1) {
                 return Promise.reject(new Error('More than one matching result.'));
@@ -49,7 +37,7 @@ const getOrCreate = (endpoint, data) => {
             return Promise.reject(new Error(`unexpected response: ${res}`));
         });
 
-    return store[endpoint][identity].then(created => created.data);
+    return store[lookup].then(created => created.data);
 };
 
 const getOrganization = (namespace = session) => getOrCreate('/organizations/', {
@@ -61,13 +49,13 @@ const getInventory = (namespace = session) => getOrganization(namespace)
     .then(organization => getOrCreate('/inventories/', {
         name: `${namespace}-inventory`,
         description: namespace,
-        organization: organization.id,
+        organization: organization.id
     }).then(inventory => getOrCreate('/hosts/', {
         name: `${namespace}-host`,
         description: namespace,
         inventory: inventory.id,
         variables: JSON.stringify({ ansible_connection: 'local' }),
-    }).then(() => inventory)));
+    }, ['name', 'inventory']).then(() => inventory)));
 
 const getHost = (namespace = session) => getInventory(namespace)
     .then(inventory => getOrCreate('/hosts/', {
@@ -75,7 +63,7 @@ const getHost = (namespace = session) => getInventory(namespace)
         description: namespace,
         inventory: inventory.id,
         variables: JSON.stringify({ ansible_connection: 'local' }),
-    }).then((host) => host));
+    }, ['name', 'inventory']));
 
 const getInventoryScript = (namespace = session) => getOrganization(namespace)
     .then(organization => getOrCreate('/inventory_scripts/', {
@@ -91,14 +79,14 @@ const getInventorySource = (namespace = session) => {
         getInventoryScript(namespace)
     ];
 
-    return all(promises)
-        .then(spread((inventory, inventoryScript) => getOrCreate('/inventory_sources/', {
+    return Promise.all(promises)
+        .then(([inventory, inventoryScript]) => getOrCreate('/inventory_sources/', {
             name: `${namespace}-inventory-source-custom`,
             description: namespace,
             source: 'custom',
             inventory: inventory.id,
             source_script: inventoryScript.id
-        })));
+        }));
 };
 
 const getAdminAWSCredential = (namespace = session) => {
@@ -109,8 +97,8 @@ const getAdminAWSCredential = (namespace = session) => {
         })
     ];
 
-    return all(promises)
-        .then(spread((me, credentialType) => {
+    return Promise.all(promises)
+        .then(([me, credentialType]) => {
             const [admin] = me.data.results;
 
             return getOrCreate('/credentials/', {
@@ -124,7 +112,7 @@ const getAdminAWSCredential = (namespace = session) => {
                     security_token: 'AAAAAAAAAAAAAAAA'
                 }
             });
-        }));
+        });
 };
 
 const getAdminMachineCredential = (namespace = session) => {
@@ -133,17 +121,16 @@ const getAdminMachineCredential = (namespace = session) => {
         getOrCreate('/credential_types/', { name: 'Machine' })
     ];
 
-    return all(promises)
-        .then(spread((me, credentialType) => {
+    return Promise.all(promises)
+        .then(([me, credentialType]) => {
             const [admin] = me.data.results;
-
             return getOrCreate('/credentials/', {
                 name: `${namespace}-credential-machine-admin`,
                 description: namespace,
                 credential_type: credentialType.id,
                 user: admin.id
             });
-        }));
+        });
 };
 
 const getTeam = (namespace = session) => getOrganization(namespace)
@@ -235,15 +222,57 @@ const getJobTemplate = (namespace = session) => {
         getUpdatedProject(namespace)
     ];
 
-    return all(promises)
-        .then(spread((inventory, credential, project) => getOrCreate('/job_templates/', {
+    return Promise.all(promises)
+        .then(([inventory, credential, project]) => getOrCreate('/job_templates/', {
             name: `${namespace}-job-template`,
             description: namespace,
             inventory: inventory.id,
             credential: credential.id,
             project: project.id,
             playbook: 'hello_world.yml',
-        })));
+        }));
+};
+
+const getWorkflowTemplate = (namespace = session) => {
+    const endpoint = '/workflow_job_templates/';
+
+    const workflowTemplatePromise = getOrganization(namespace)
+        .then(organization => getOrCreate(endpoint, {
+            name: `${namespace}-workflow-template`,
+            organization: organization.id,
+            variables: '---',
+            extra_vars: '',
+        }));
+
+    const resources = [
+        workflowTemplatePromise,
+        getInventorySource(namespace),
+        getUpdatedProject(namespace),
+        getJobTemplate(namespace),
+    ];
+
+    const workflowNodePromise = Promise.all(resources)
+        .then(([workflowTemplate, source, project, jobTemplate]) => {
+            const workflowNodes = workflowTemplate.related.workflow_nodes;
+            const unique = 'unified_job_template';
+
+            const nodes = [
+                getOrCreate(workflowNodes, { [unique]: project.id }, [unique]),
+                getOrCreate(workflowNodes, { [unique]: jobTemplate.id }, [unique]),
+                getOrCreate(workflowNodes, { [unique]: source.id }, [unique]),
+            ];
+
+            const createSuccessNodes = ([projectNode, jobNode, sourceNode]) => Promise.all([
+                getOrCreate(projectNode.related.success_nodes, { id: jobNode.id }, ['id']),
+                getOrCreate(jobNode.related.success_nodes, { id: sourceNode.id }, ['id']),
+            ]);
+
+            return Promise.all(nodes)
+                .then(createSuccessNodes);
+        });
+
+    return Promise.all([workflowTemplatePromise, workflowNodePromise])
+        .then(([workflowTemplate, nodes]) => workflowTemplate);
 };
 
 const getAuditor = (namespace = session) => getOrganization(namespace)
@@ -256,7 +285,7 @@ const getAuditor = (namespace = session) => getOrganization(namespace)
         is_superuser: false,
         is_system_auditor: true,
         password: AWX_E2E_PASSWORD
-    }));
+    }, ['username']));
 
 const getUser = (namespace = session) => getOrganization(namespace)
     .then(organization => getOrCreate('/users/', {
@@ -268,7 +297,7 @@ const getUser = (namespace = session) => getOrganization(namespace)
         is_superuser: false,
         is_system_auditor: false,
         password: AWX_E2E_PASSWORD
-    }));
+    }, ['username']));
 
 const getJobTemplateAdmin = (namespace = session) => {
     const rolePromise = getJobTemplate(namespace)
@@ -284,13 +313,36 @@ const getJobTemplateAdmin = (namespace = session) => {
             is_superuser: false,
             is_system_auditor: false,
             password: AWX_E2E_PASSWORD
-        }));
+        }, ['username']));
 
     const assignRolePromise = Promise.all([userPromise, rolePromise])
-        .then(spread((user, role) => post(`/api/v2/roles/${role.id}/users/`, { id: user.id })));
+        .then(([user, role]) => post(`/api/v2/roles/${role.id}/users/`, { id: user.id }));
 
     return Promise.all([userPromise, assignRolePromise])
-        .then(spread(user => user));
+        .then(([user, assignment]) => user);
+};
+
+const getProjectAdmin = (namespace = session) => {
+    const rolePromise = getUpdatedProject(namespace)
+        .then(obj => obj.summary_fields.object_roles.admin_role);
+
+    const userPromise = getOrganization(namespace)
+        .then(obj => getOrCreate('/users/', {
+            username: `project-admin-${uuid().substr(0, 8)}`,
+            organization: obj.id,
+            first_name: 'firstname',
+            last_name: 'lastname',
+            email: 'null@ansible.com',
+            is_superuser: false,
+            is_system_auditor: false,
+            password: AWX_E2E_PASSWORD
+        }, ['username']));
+
+    const assignRolePromise = Promise.all([userPromise, rolePromise])
+        .then(([user, role]) => post(`/api/v2/roles/${role.id}/users/`, { id: user.id }));
+
+    return Promise.all([userPromise, assignRolePromise])
+        .then(([user, assignment]) => user);
 };
 
 const getInventorySourceSchedule = (namespace = session) => getInventorySource(namespace)
@@ -311,20 +363,23 @@ module.exports = {
     getAdminAWSCredential,
     getAdminMachineCredential,
     getAuditor,
+    getHost,
     getInventory,
     getInventoryScript,
     getInventorySource,
     getInventorySourceSchedule,
+    getJob,
     getJobTemplate,
     getJobTemplateAdmin,
     getJobTemplateSchedule,
     getNotificationTemplate,
-    getOrCreate,
     getOrganization,
+    getOrCreate,
+    getProject,
+    getProjectAdmin,
     getSmartInventory,
     getTeam,
     getUpdatedProject,
     getUser,
-    getJob,
-    getHost,
+    getWorkflowTemplate,
 };

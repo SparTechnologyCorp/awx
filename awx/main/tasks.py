@@ -6,6 +6,7 @@ from collections import OrderedDict, namedtuple
 import ConfigParser
 import cStringIO
 import functools
+import importlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import stat
 import tempfile
 import time
 import traceback
+import six
 import urlparse
 from distutils.version import LooseVersion as Version
 import yaml
@@ -31,6 +33,7 @@ from celery.signals import celeryd_init, worker_process_init, worker_shutdown, w
 # Django
 from django.conf import settings
 from django.db import transaction, DatabaseError, IntegrityError
+from django.db.models.fields.related import ForeignKey
 from django.utils.timezone import now, timedelta
 from django.utils.encoding import smart_str
 from django.core.mail import send_mail
@@ -178,7 +181,7 @@ def apply_cluster_membership_policies(self):
                 g.instances.append(i.obj.id)
                 g.obj.instances.add(i.obj)
                 i.groups.append(g.obj.id)
-        handle_ha_toplogy_changes.apply_async()
+        handle_ha_toplogy_changes()
 
 
 @shared_task(queue='tower_broadcast_all', bind=True, base=LogErrorsTask)
@@ -196,6 +199,8 @@ def handle_setting_changes(self, setting_keys):
         if key.startswith('LOG_AGGREGATOR_'):
             restart_local_services(['uwsgi', 'celery', 'beat', 'callback'])
             break
+        elif key == 'OAUTH2_PROVIDER':
+            restart_local_services(['uwsgi'])
 
 
 @shared_task(bind=True, queue='tower_broadcast_all', base=LogErrorsTask)
@@ -204,20 +209,22 @@ def handle_ha_toplogy_changes(self):
     logger.debug("Reconfigure celeryd queues task on host {}".format(self.request.hostname))
     awx_app = Celery('awx')
     awx_app.config_from_object('django.conf:settings', namespace='CELERY')
-    (instance, removed_queues, added_queues) = register_celery_worker_queues(awx_app, self.request.hostname)
-    logger.info("Workers on tower node '{}' removed from queues {} and added to queues {}"
-                .format(instance.hostname, removed_queues, added_queues))
-    updated_routes = update_celery_worker_routes(instance, settings)
-    logger.info("Worker on tower node '{}' updated celery routes {} all routes are now {}"
-                .format(instance.hostname, updated_routes, self.app.conf.CELERY_TASK_ROUTES))
+    instances, removed_queues, added_queues = register_celery_worker_queues(awx_app, self.request.hostname)
+    for instance in instances:
+        logger.info("Workers on tower node '{}' removed from queues {} and added to queues {}"
+                    .format(instance.hostname, removed_queues, added_queues))
+        updated_routes = update_celery_worker_routes(instance, settings)
+        logger.info("Worker on tower node '{}' updated celery routes {} all routes are now {}"
+                    .format(instance.hostname, updated_routes, self.app.conf.CELERY_TASK_ROUTES))
 
 
 @worker_ready.connect
 def handle_ha_toplogy_worker_ready(sender, **kwargs):
     logger.debug("Configure celeryd queues task on host {}".format(sender.hostname))
-    (instance, removed_queues, added_queues) = register_celery_worker_queues(sender.app, sender.hostname)
-    logger.info("Workers on tower node '{}' unsubscribed from queues {} and subscribed to queues {}"
-                .format(instance.hostname, removed_queues, added_queues))
+    instances, removed_queues, added_queues = register_celery_worker_queues(sender.app, sender.hostname)
+    for instance in instances:
+        logger.info("Workers on tower node '{}' unsubscribed from queues {} and subscribed to queues {}"
+                    .format(instance.hostname, removed_queues, added_queues))
 
 
 @celeryd_init.connect
@@ -281,12 +288,6 @@ def run_administrative_checks(self):
                   _("Ansible Tower license will expire soon"),
                   tower_admin_emails,
                   fail_silently=True)
-
-
-@shared_task(bind=True, queue='tower', base=LogErrorsTask)
-def cleanup_authtokens(self):
-    logger.warn("Cleaning up expired authtokens.")
-    AuthToken.objects.filter(expires__lt=now()).delete()
 
 
 @shared_task(bind=True, base=LogErrorsTask)
@@ -725,6 +726,14 @@ class BaseTask(LogErrorsTask):
             '': '',
         }
 
+    def build_extra_vars_file(self, vars, **kwargs):
+        handle, path = tempfile.mkstemp(dir=kwargs.get('private_data_dir', None))
+        f = os.fdopen(handle, 'w')
+        f.write(json.dumps(vars))
+        f.close()
+        os.chmod(path, stat.S_IRUSR)
+        return path
+
     def add_ansible_venv(self, venv_path, env, add_awx_lib=True):
         env['VIRTUAL_ENV'] = venv_path
         env['PATH'] = os.path.join(venv_path, "bin") + ":" + env['PATH']
@@ -767,6 +776,7 @@ class BaseTask(LogErrorsTask):
         # Derived class should call add_ansible_venv() or add_awx_venv()
         if self.should_use_proot(instance, **kwargs):
             env['PROOT_TMP_DIR'] = settings.AWX_PROOT_BASE_PATH
+        env['AWX_PRIVATE_DATA_DIR'] = kwargs['private_data_dir']
         return env
 
     def should_use_proot(self, instance, **kwargs):
@@ -884,6 +894,15 @@ class BaseTask(LogErrorsTask):
             # Fetch ansible version once here to support version-dependent features.
             kwargs['ansible_version'] = get_ansible_version()
             kwargs['private_data_dir'] = self.build_private_data_dir(instance, **kwargs)
+
+            # Fetch "cached" fact data from prior runs and put on the disk
+            # where ansible expects to find it
+            if getattr(instance, 'use_fact_cache', False):
+                instance.start_job_fact_cache(
+                    os.path.join(kwargs['private_data_dir']),
+                    kwargs.setdefault('fact_modification_times', {})
+                )
+
             # May have to serialize the value
             kwargs['private_data_files'] = self.build_private_data_files(instance, **kwargs)
             kwargs['passwords'] = self.build_passwords(instance, **kwargs)
@@ -901,8 +920,11 @@ class BaseTask(LogErrorsTask):
             credentials = []
             if isinstance(instance, Job):
                 credentials = instance.credentials.all()
-            elif hasattr(instance, 'credential'):
-                # once other UnifiedJobs (project updates, inventory updates)
+            elif isinstance(instance, InventoryUpdate):
+                # TODO: allow multiple custom creds for inv updates
+                credentials = [instance.get_cloud_credential()]
+            elif isinstance(instance, Project):
+                # once (or if) project updates
                 # move from a .credential -> .credentials model, we can
                 # lose this block
                 credentials = [instance.credential]
@@ -1114,12 +1136,16 @@ class RunJob(BaseTask):
         # callbacks to work.
         env['JOB_ID'] = str(job.pk)
         env['INVENTORY_ID'] = str(job.inventory.pk)
-        if job.use_fact_cache and not kwargs.get('isolated'):
-            env['ANSIBLE_LIBRARY'] = self.get_path_to('..', 'plugins', 'library')
-            env['ANSIBLE_CACHE_PLUGINS'] = self.get_path_to('..', 'plugins', 'fact_caching')
-            env['ANSIBLE_CACHE_PLUGIN'] = "awx"
-            env['ANSIBLE_CACHE_PLUGIN_TIMEOUT'] = str(settings.ANSIBLE_FACT_CACHE_TIMEOUT)
-            env['ANSIBLE_CACHE_PLUGIN_CONNECTION'] = settings.CACHES['default']['LOCATION'] if 'LOCATION' in settings.CACHES['default'] else ''
+        if job.use_fact_cache:
+            library_path = env.get('ANSIBLE_LIBRARY')
+            env['ANSIBLE_LIBRARY'] = ':'.join(
+                filter(None, [
+                    library_path,
+                    self.get_path_to('..', 'plugins', 'library')
+                ])
+            )
+            env['ANSIBLE_CACHE_PLUGIN'] = "jsonfile"
+            env['ANSIBLE_CACHE_PLUGIN_CONNECTION'] = os.path.join(kwargs['private_data_dir'], 'facts')
         if job.project:
             env['PROJECT_REVISION'] = job.project.scm_revision
         env['ANSIBLE_RETRY_FILES_ENABLED'] = "False"
@@ -1135,7 +1161,7 @@ class RunJob(BaseTask):
         # job and visible inside the proot environment (when enabled).
         cp_dir = os.path.join(kwargs['private_data_dir'], 'cp')
         if not os.path.exists(cp_dir):
-            os.mkdir(cp_dir, 0700)
+            os.mkdir(cp_dir, 0o700)
         env['ANSIBLE_SSH_CONTROL_PATH'] = os.path.join(cp_dir, '%%h%%p%%r')
 
         # Allow the inventory script to include host variables inline via ['_meta']['hostvars'].
@@ -1158,7 +1184,7 @@ class RunJob(BaseTask):
                 env['ANSIBLE_NET_SSH_KEYFILE'] = ssh_keyfile
 
             authorize = network_cred.authorize
-            env['ANSIBLE_NET_AUTHORIZE'] = unicode(int(authorize))
+            env['ANSIBLE_NET_AUTHORIZE'] = six.text_type(int(authorize))
             if authorize:
                 env['ANSIBLE_NET_AUTH_PASS'] = decrypt_field(network_cred, 'authorize_password')
 
@@ -1234,7 +1260,8 @@ class RunJob(BaseTask):
                 extra_vars.update(json.loads(job.display_extra_vars()))
             else:
                 extra_vars.update(json.loads(job.decrypted_extra_vars()))
-        args.extend(['-e', json.dumps(extra_vars)])
+        extra_vars_path = self.build_extra_vars_file(vars=extra_vars, **kwargs)
+        args.extend(['-e', '@%s' % (extra_vars_path)])
 
         # Add path to playbook (relative to project.local_path).
         args.append(job.playbook)
@@ -1261,6 +1288,7 @@ class RunJob(BaseTask):
         for method in PRIVILEGE_ESCALATION_METHODS:
             d[re.compile(r'%s password.*:\s*?$' % (method[0]), re.M)] = 'become_password'
             d[re.compile(r'%s password.*:\s*?$' % (method[0].upper()), re.M)] = 'become_password'
+        d[re.compile(r'BECOME password.*:\s*?$', re.M)] = 'become_password'
         d[re.compile(r'SSH password:\s*?$', re.M)] = 'ssh_password'
         d[re.compile(r'Password:\s*?$', re.M)] = 'ssh_password'
         d[re.compile(r'Vault password:\s*?$', re.M)] = 'vault_password'
@@ -1314,14 +1342,29 @@ class RunJob(BaseTask):
                                                              ('project_update', local_project_sync.name, local_project_sync.id)))
                     raise
 
-        if job.use_fact_cache and not kwargs.get('isolated'):
-            job.start_job_fact_cache()
-
 
     def final_run_hook(self, job, status, **kwargs):
         super(RunJob, self).final_run_hook(job, status, **kwargs)
-        if job.use_fact_cache and not kwargs.get('isolated'):
-            job.finish_job_fact_cache()
+        if job.use_fact_cache:
+            job.finish_job_fact_cache(
+                kwargs['private_data_dir'],
+                kwargs['fact_modification_times']
+            )
+
+        # persist artifacts set via `set_stat` (if any)
+        custom_stats_path = os.path.join(kwargs['private_data_dir'], 'artifacts', 'custom')
+        if os.path.exists(custom_stats_path):
+            with open(custom_stats_path, 'r') as f:
+                custom_stat_data = None
+                try:
+                    custom_stat_data = json.load(f)
+                except ValueError:
+                    logger.warning('Could not parse custom `set_fact` data for job {}'.format(job.id))
+
+                if custom_stat_data:
+                    job.artifacts = custom_stat_data
+                    job.save(update_fields=['artifacts'])
+
         try:
             inventory = job.inventory
         except Inventory.DoesNotExist:
@@ -1464,7 +1507,8 @@ class RunProjectUpdate(BaseTask):
             'scm_revision_output': self.revision_path,
             'scm_revision': project_update.project.scm_revision,
         })
-        args.extend(['-e', json.dumps(extra_vars)])
+        extra_vars_path = self.build_extra_vars_file(vars=extra_vars, **kwargs)
+        args.extend(['-e', '@%s' % (extra_vars_path)])
         args.append('project_update.yml')
         return args
 
@@ -1538,15 +1582,15 @@ class RunProjectUpdate(BaseTask):
             if not inv_src.update_on_project_update:
                 continue
             if inv_src.scm_last_revision == scm_revision:
-                logger.debug('Skipping SCM inventory update for `{}` because '
-                             'project has not changed.'.format(inv_src.name))
+                logger.debug(six.text_type('Skipping SCM inventory update for `{}` because '
+                                           'project has not changed.').format(inv_src.name))
                 continue
-            logger.debug('Local dependent inventory update for `{}`.'.format(inv_src.name))
+            logger.debug(six.text_type('Local dependent inventory update for `{}`.').format(inv_src.name))
             with transaction.atomic():
                 if InventoryUpdate.objects.filter(inventory_source=inv_src,
                                                   status__in=ACTIVE_STATES).exists():
-                    logger.info('Skipping SCM inventory update for `{}` because '
-                                'another update is already active.'.format(inv_src.name))
+                    logger.info(six.text_type('Skipping SCM inventory update for `{}` because '
+                                              'another update is already active.').format(inv_src.name))
                     continue
                 local_inv_update = inv_src.create_inventory_update(
                     _eager_fields=dict(
@@ -1674,14 +1718,13 @@ class RunInventoryUpdate(BaseTask):
         If no private data is needed, return None.
         """
         private_data = {'credentials': {}}
+        credential = inventory_update.get_cloud_credential()
         # If this is GCE, return the RSA key
         if inventory_update.source == 'gce':
-            credential = inventory_update.credential
             private_data['credentials'][credential] = decrypt_field(credential, 'ssh_key_data')
             return private_data
 
         if inventory_update.source == 'openstack':
-            credential = inventory_update.credential
             openstack_auth = dict(auth_url=credential.host,
                                   username=credential.username,
                                   password=decrypt_field(credential, "password"),
@@ -1755,10 +1798,9 @@ class RunInventoryUpdate(BaseTask):
                 ec2_opts['cache_path'] = cache_path
             ec2_opts.setdefault('cache_max_age', '300')
             for k,v in ec2_opts.items():
-                cp.set(section, k, unicode(v))
+                cp.set(section, k, six.text_type(v))
         # Allow custom options to vmware inventory script.
         elif inventory_update.source == 'vmware':
-            credential = inventory_update.credential
 
             section = 'vmware'
             cp.add_section(section)
@@ -1775,7 +1817,7 @@ class RunInventoryUpdate(BaseTask):
                 vmware_opts.setdefault('groupby_patterns', inventory_update.group_by)
 
             for k,v in vmware_opts.items():
-                cp.set(section, k, unicode(v))
+                cp.set(section, k, six.text_type(v))
 
         elif inventory_update.source == 'satellite6':
             section = 'foreman'
@@ -1791,9 +1833,8 @@ class RunInventoryUpdate(BaseTask):
                 elif k == 'satellite6_group_prefix' and isinstance(v, basestring):
                     group_prefix = v
                 else:
-                    cp.set(section, k, unicode(v))
+                    cp.set(section, k, six.text_type(v))
 
-            credential = inventory_update.credential
             if credential:
                 cp.set(section, 'url', credential.host)
                 cp.set(section, 'user', credential.username)
@@ -1814,7 +1855,6 @@ class RunInventoryUpdate(BaseTask):
             section = 'cloudforms'
             cp.add_section(section)
 
-            credential = inventory_update.credential
             if credential:
                 cp.set(section, 'url', credential.host)
                 cp.set(section, 'username', credential.username)
@@ -1852,7 +1892,7 @@ class RunInventoryUpdate(BaseTask):
         if cp.sections():
             f = cStringIO.StringIO()
             cp.write(f)
-            private_data['credentials'][inventory_update.credential] = f.getvalue()
+            private_data['credentials'][credential] = f.getvalue()
             return private_data
 
     def build_passwords(self, inventory_update, **kwargs):
@@ -1867,7 +1907,7 @@ class RunInventoryUpdate(BaseTask):
 
         # Take key fields from the credential in use and add them to the
         # passwords dictionary.
-        credential = inventory_update.credential
+        credential = inventory_update.get_cloud_credential()
         if credential:
             for subkey in ('username', 'host', 'project', 'client', 'tenant', 'subscription'):
                 passwords['source_%s' % subkey] = getattr(credential, subkey)
@@ -1889,6 +1929,8 @@ class RunInventoryUpdate(BaseTask):
         # Pass inventory source ID to inventory script.
         env['INVENTORY_SOURCE_ID'] = str(inventory_update.inventory_source_id)
         env['INVENTORY_UPDATE_ID'] = str(inventory_update.pk)
+        # Always use the --export option for ansible-inventory
+        env['ANSIBLE_INVENTORY_EXPORT'] = str(True)
 
         # Set environment variables specific to each source.
         #
@@ -1910,7 +1952,9 @@ class RunInventoryUpdate(BaseTask):
         }
         if inventory_update.source in ini_mapping:
             cred_data = kwargs.get('private_data_files', {}).get('credentials', '')
-            env[ini_mapping[inventory_update.source]] = cred_data.get(inventory_update.credential, '')
+            env[ini_mapping[inventory_update.source]] = cred_data.get(
+                inventory_update.get_cloud_credential(), ''
+            )
 
         if inventory_update.source == 'gce':
             env['GCE_ZONE'] = inventory_update.source_regions if inventory_update.source_regions != 'all' else ''  # noqa
@@ -1927,7 +1971,7 @@ class RunInventoryUpdate(BaseTask):
         elif inventory_update.source in ['scm', 'custom']:
             for env_k in inventory_update.source_vars_dict:
                 if str(env_k) not in env and str(env_k) not in settings.INV_ENV_VARIABLE_BLACKLIST:
-                    env[str(env_k)] = unicode(inventory_update.source_vars_dict[env_k])
+                    env[str(env_k)] = six.text_type(inventory_update.source_vars_dict[env_k])
         elif inventory_update.source == 'tower':
             env['TOWER_INVENTORY'] = inventory_update.instance_filters
             env['TOWER_LICENSE_TYPE'] = get_licenser().validate()['license_type']
@@ -2181,7 +2225,8 @@ class RunAdHocCommand(BaseTask):
                     "{} are prohibited from use in ad hoc commands."
                 ).format(", ".join(removed_vars)))
             extra_vars.update(ad_hoc_command.extra_vars_dict)
-        args.extend(['-e', json.dumps(extra_vars)])
+        extra_vars_path = self.build_extra_vars_file(vars=extra_vars, **kwargs)
+        args.extend(['-e', '@%s' % (extra_vars_path)])
 
         args.extend(['-m', ad_hoc_command.module_name])
         args.extend(['-a', ad_hoc_command.module_args])
@@ -2206,6 +2251,7 @@ class RunAdHocCommand(BaseTask):
         for method in PRIVILEGE_ESCALATION_METHODS:
             d[re.compile(r'%s password.*:\s*?$' % (method[0]), re.M)] = 'become_password'
             d[re.compile(r'%s password.*:\s*?$' % (method[0].upper()), re.M)] = 'become_password'
+        d[re.compile(r'BECOME password.*:\s*?$', re.M)] = 'become_password'
         d[re.compile(r'SSH password:\s*?$', re.M)] = 'ssh_password'
         d[re.compile(r'Password:\s*?$', re.M)] = 'ssh_password'
         return d
@@ -2257,6 +2303,62 @@ class RunSystemJob(BaseTask):
 
     def build_cwd(self, instance, **kwargs):
         return settings.BASE_DIR
+
+
+def _reconstruct_relationships(copy_mapping):
+    for old_obj, new_obj in copy_mapping.items():
+        model = type(old_obj)
+        for field_name in getattr(model, 'FIELDS_TO_PRESERVE_AT_COPY', []):
+            field = model._meta.get_field(field_name)
+            if isinstance(field, ForeignKey):
+                if getattr(new_obj, field_name, None):
+                    continue
+                related_obj = getattr(old_obj, field_name)
+                related_obj = copy_mapping.get(related_obj, related_obj)
+                setattr(new_obj, field_name, related_obj)
+            elif field.many_to_many:
+                for related_obj in getattr(old_obj, field_name).all():
+                    getattr(new_obj, field_name).add(copy_mapping.get(related_obj, related_obj))
+        new_obj.save()
+
+
+@shared_task(bind=True, queue='tower', base=LogErrorsTask)
+def deep_copy_model_obj(
+    self, model_module, model_name, obj_pk, new_obj_pk,
+    user_pk, sub_obj_list, permission_check_func=None
+):
+    logger.info('Deep copy {} from {} to {}.'.format(model_name, obj_pk, new_obj_pk))
+    from awx.api.generics import CopyAPIView
+    model = getattr(importlib.import_module(model_module), model_name, None)
+    if model is None:
+        return
+    try:
+        obj = model.objects.get(pk=obj_pk)
+        new_obj = model.objects.get(pk=new_obj_pk)
+        creater = User.objects.get(pk=user_pk)
+    except ObjectDoesNotExist:
+        logger.warning("Object or user no longer exists.")
+        return
+    with transaction.atomic():
+        copy_mapping = {}
+        for sub_obj_setup in sub_obj_list:
+            sub_model = getattr(importlib.import_module(sub_obj_setup[0]),
+                                sub_obj_setup[1], None)
+            if sub_model is None:
+                continue
+            try:
+                sub_obj = sub_model.objects.get(pk=sub_obj_setup[2])
+            except ObjectDoesNotExist:
+                continue
+            copy_mapping.update(CopyAPIView.copy_model_obj(
+                obj, new_obj, sub_model, sub_obj, creater
+            ))
+        _reconstruct_relationships(copy_mapping)
+        if permission_check_func:
+            permission_check_func = getattr(getattr(
+                importlib.import_module(permission_check_func[0]), permission_check_func[1]
+            ), permission_check_func[2])
+            permission_check_func(creater, copy_mapping.values())
 
 
 celery_app.register_task(RunJob())

@@ -103,18 +103,22 @@ def test_safe_env_returns_new_copy():
 
 def test_openstack_client_config_generation(mocker):
     update = tasks.RunInventoryUpdate()
+    credential = mocker.Mock(**{
+        'host': 'https://keystone.openstack.example.org',
+        'username': 'demo',
+        'password': 'secrete',
+        'project': 'demo-project',
+        'domain': 'my-demo-domain',
+    })
+    cred_method = mocker.Mock(return_value=credential)
     inventory_update = mocker.Mock(**{
         'source': 'openstack',
-        'credential.host': 'https://keystone.openstack.example.org',
-        'credential.username': 'demo',
-        'credential.password': 'secrete',
-        'credential.project': 'demo-project',
-        'credential.domain': 'my-demo-domain',
-        'source_vars_dict': {}
+        'source_vars_dict': {},
+        'get_cloud_credential': cred_method
     })
     cloud_config = update.build_private_data(inventory_update)
     cloud_credential = yaml.load(
-        cloud_config.get('credentials')[inventory_update.credential]
+        cloud_config.get('credentials')[credential]
     )
     assert cloud_credential['clouds'] == {
         'devstack': {
@@ -135,18 +139,22 @@ def test_openstack_client_config_generation(mocker):
 ])
 def test_openstack_client_config_generation_with_private_source_vars(mocker, source, expected):
     update = tasks.RunInventoryUpdate()
+    credential = mocker.Mock(**{
+        'host': 'https://keystone.openstack.example.org',
+        'username': 'demo',
+        'password': 'secrete',
+        'project': 'demo-project',
+        'domain': None,
+    })
+    cred_method = mocker.Mock(return_value=credential)
     inventory_update = mocker.Mock(**{
         'source': 'openstack',
-        'credential.host': 'https://keystone.openstack.example.org',
-        'credential.username': 'demo',
-        'credential.password': 'secrete',
-        'credential.project': 'demo-project',
-        'credential.domain': None,
-        'source_vars_dict': {'private': source}
+        'source_vars_dict': {'private': source},
+        'get_cloud_credential': cred_method
     })
     cloud_config = update.build_private_data(inventory_update)
     cloud_credential = yaml.load(
-        cloud_config.get('credentials')[inventory_update.credential]
+        cloud_config.get('credentials')[credential]
     )
     assert cloud_credential['clouds'] == {
         'devstack': {
@@ -172,6 +180,15 @@ def pytest_generate_tests(metafunc):
                 argnames,
                 [[funcargs[name] for name in argnames] for funcargs in funcarglist]
             )
+
+
+def parse_extra_vars(args):
+    extra_vars = {}
+    for chunk in args:
+        if chunk.startswith('@/tmp/'):
+            with open(chunk.strip('@'), 'r') as f:
+                extra_vars.update(json.load(f))
+    return extra_vars
 
 
 class TestJobExecution:
@@ -318,15 +335,18 @@ class TestGenericRun(TestJobExecution):
 
     def test_created_by_extra_vars(self):
         self.instance.created_by = User(pk=123, username='angry-spud')
-        self.task.run(self.pk)
 
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-        assert '"tower_user_id": 123,' in ' '.join(args)
-        assert '"tower_user_name": "angry-spud"' in ' '.join(args)
-        assert '"awx_user_id": 123,' in ' '.join(args)
-        assert '"awx_user_name": "angry-spud"' in ' '.join(args)
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars['tower_user_id'] == 123
+            assert extra_vars['tower_user_name'] == "angry-spud"
+            assert extra_vars['awx_user_id'] == 123
+            assert extra_vars['awx_user_name'] == "angry-spud"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
+        self.task.run(self.pk)
 
     def test_survey_extra_vars(self):
         self.instance.extra_vars = json.dumps({
@@ -335,12 +355,15 @@ class TestGenericRun(TestJobExecution):
         self.instance.survey_passwords = {
             'super_secret': '$encrypted$'
         }
-        self.task.run(self.pk)
 
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-        assert '"super_secret": "CLASSIFIED"' in ' '.join(args)
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars['super_secret'] == "CLASSIFIED"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
+        self.task.run(self.pk)
 
     def test_awx_task_env(self):
         patch = mock.patch('awx.main.tasks.settings.AWX_TASK_ENV', {'FOO': 'BAR'})
@@ -377,6 +400,42 @@ class TestGenericRun(TestJobExecution):
         tb = self.task.update_model.call_args[-1]['result_traceback']
         assert 'a valid Python virtualenv does not exist at /venv/missing' in tb
 
+    def test_fact_cache_usage(self):
+        self.instance.use_fact_cache = True
+
+        start_mock = mock.Mock()
+        patch = mock.patch.object(Job, 'start_job_fact_cache', start_mock)
+        self.patches.append(patch)
+        patch.start()
+
+        self.task.run(self.pk)
+        call_args, _ = self.run_pexpect.call_args_list[0]
+        args, cwd, env, stdout = call_args
+        start_mock.assert_called_once()
+        tmpdir, _ = start_mock.call_args[0]
+
+        assert env['ANSIBLE_CACHE_PLUGIN'] == 'jsonfile'
+        assert env['ANSIBLE_CACHE_PLUGIN_CONNECTION'] == os.path.join(tmpdir, 'facts')
+
+    @pytest.mark.parametrize('task_env, ansible_library_env', [
+        [{}, '/awx_devel/awx/plugins/library'],
+        [{'ANSIBLE_LIBRARY': '/foo/bar'}, '/foo/bar:/awx_devel/awx/plugins/library'],
+    ])
+    def test_fact_cache_usage_with_ansible_library(self, task_env, ansible_library_env):
+        patch = mock.patch('awx.main.tasks.settings.AWX_TASK_ENV', task_env)
+        patch.start()
+
+        self.instance.use_fact_cache = True
+        start_mock = mock.Mock()
+        patch = mock.patch.object(Job, 'start_job_fact_cache', start_mock)
+        self.patches.append(patch)
+        patch.start()
+
+        self.task.run(self.pk)
+        call_args, _ = self.run_pexpect.call_args_list[0]
+        args, cwd, env, stdout = call_args
+        assert env['ANSIBLE_LIBRARY'] == ansible_library_env
+
 
 class TestAdhocRun(TestJobExecution):
 
@@ -394,16 +453,19 @@ class TestAdhocRun(TestJobExecution):
 
     def test_created_by_extra_vars(self):
         self.instance.created_by = User(pk=123, username='angry-spud')
-        self.task.run(self.pk)
 
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-        assert '"tower_user_id": 123,' in ' '.join(args)
-        assert '"tower_user_name": "angry-spud"' in ' '.join(args)
-        assert '"awx_user_id": 123,' in ' '.join(args)
-        assert '"awx_user_name": "angry-spud"' in ' '.join(args)
-        assert '"awx_foo": "awx-bar' in ' '.join(args)
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars['tower_user_id'] == 123
+            assert extra_vars['tower_user_name'] == "angry-spud"
+            assert extra_vars['awx_user_id'] == 123
+            assert extra_vars['awx_user_name'] == "angry-spud"
+            assert extra_vars['awx_foo'] == "awx-bar"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
+        self.task.run(self.pk)
 
 
 class TestIsolatedExecution(TestJobExecution):
@@ -1082,13 +1144,15 @@ class TestJobCredentials(TestJobExecution):
             inputs = {'api_token': 'ABC123'}
         )
         self.instance.credentials.add(credential)
+
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars["api_token"] == "ABC123"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
         self.task.run(self.pk)
-
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-
-        assert '-e {"api_token": "ABC123"}' in ' '.join(args)
 
     def test_custom_environment_injectors_with_boolean_extra_vars(self):
         some_cloud = CredentialType(
@@ -1114,12 +1178,15 @@ class TestJobCredentials(TestJobExecution):
             inputs={'turbo_button': True}
         )
         self.instance.credentials.add(credential)
-        self.task.run(self.pk)
 
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-        assert '-e {"turbo_button": "True"}' in ' '.join(args)
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars["turbo_button"] == "True"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
+        self.task.run(self.pk)
 
     def test_custom_environment_injectors_with_complicated_boolean_template(self):
         some_cloud = CredentialType(
@@ -1145,12 +1212,15 @@ class TestJobCredentials(TestJobExecution):
             inputs={'turbo_button': True}
         )
         self.instance.credentials.add(credential)
-        self.task.run(self.pk)
 
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-        assert '-e {"turbo_button": "FAST!"}' in ' '.join(args)
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars["turbo_button"] == "FAST!"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
+        self.task.run(self.pk)
 
     def test_custom_environment_injectors_with_secret_extra_vars(self):
         """
@@ -1181,13 +1251,16 @@ class TestJobCredentials(TestJobExecution):
         )
         credential.inputs['password'] = encrypt_field(credential, 'password')
         self.instance.credentials.add(credential)
+
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert extra_vars["password"] == "SUPER-SECRET-123"
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
         self.task.run(self.pk)
 
-        assert self.run_pexpect.call_count == 1
-        call_args, _ = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-
-        assert '-e {"password": "SUPER-SECRET-123"}' in ' '.join(args)
         assert 'SUPER-SECRET-123' not in json.dumps(self.task.update_model.call_args_list)
 
     def test_custom_environment_injectors_with_file(self):
@@ -1358,19 +1431,21 @@ class TestProjectUpdateCredentials(TestJobExecution):
             pk=1,
             credential_type=ssh,
         )
+
+        def run_pexpect_side_effect(*args, **kwargs):
+            args, cwd, env, stdout = args
+            extra_vars = parse_extra_vars(args)
+            assert ' '.join(args).startswith('bwrap')
+            assert ' '.join([
+                '--bind',
+                os.path.realpath(settings.PROJECTS_ROOT),
+                os.path.realpath(settings.PROJECTS_ROOT)
+            ]) in ' '.join(args)
+            assert extra_vars["scm_revision_output"].startswith(settings.PROJECTS_ROOT)
+            return ['successful', 0]
+
+        self.run_pexpect.side_effect = run_pexpect_side_effect
         self.task.run(self.pk)
-
-        assert self.run_pexpect.call_count == 1
-        call_args, call_kwargs = self.run_pexpect.call_args_list[0]
-        args, cwd, env, stdout = call_args
-
-        assert ' '.join(args).startswith('bwrap')
-        ' '.join([
-            '--bind',
-            settings.PROJECTS_ROOT,
-            settings.PROJECTS_ROOT,
-        ]) in ' '.join(args)
-        assert '"scm_revision_output": "/projects/tmp' in ' '.join(args)
 
     def test_username_and_password_auth(self, scm_type):
         ssh = CredentialType.defaults['ssh']()
@@ -1452,8 +1527,9 @@ class TestInventoryUpdateCredentials(TestJobExecution):
             )
         )
 
-    def test_source_without_credential(self):
+    def test_source_without_credential(self, mocker):
         self.instance.source = 'ec2'
+        self.instance.get_cloud_credential = mocker.Mock(return_value=None)
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1471,7 +1547,7 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         self.task.run(self.pk)
 
     @pytest.mark.parametrize('with_credential', [True, False])
-    def test_custom_source(self, with_credential):
+    def test_custom_source(self, with_credential, mocker):
         self.instance.source = 'custom'
         self.instance.source_vars = '{"FOO": "BAR"}'
         patch = mock.patch.object(InventoryUpdate, 'source_script', mock.Mock(
@@ -1482,16 +1558,22 @@ class TestInventoryUpdateCredentials(TestJobExecution):
 
         if with_credential:
             azure_rm = CredentialType.defaults['azure_rm']()
-            self.instance.credential = Credential(
-                pk=1,
-                credential_type=azure_rm,
-                inputs = {
-                    'client': 'some-client',
-                    'secret': 'some-secret',
-                    'tenant': 'some-tenant',
-                    'subscription': 'some-subscription',
-                }
-            )
+
+            def get_cred():
+                cred = Credential(
+                    pk=1,
+                    credential_type=azure_rm,
+                    inputs = {
+                        'client': 'some-client',
+                        'secret': 'some-secret',
+                        'tenant': 'some-tenant',
+                        'subscription': 'some-subscription',
+                    }
+                )
+                return cred
+            self.instance.get_cloud_credential = get_cred
+        else:
+            self.instance.get_cloud_credential = mocker.Mock(return_value=None)
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1513,14 +1595,16 @@ class TestInventoryUpdateCredentials(TestJobExecution):
     def test_ec2_source(self):
         aws = CredentialType.defaults['aws']()
         self.instance.source = 'ec2'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=aws,
-            inputs = {'username': 'bob', 'password': 'secret'}
-        )
-        self.instance.credential.inputs['password'] = encrypt_field(
-            self.instance.credential, 'password'
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=aws,
+                inputs = {'username': 'bob', 'password': 'secret'}
+            )
+            cred.inputs['password'] = encrypt_field(cred, 'password')
+            return cred
+        self.instance.get_cloud_credential = get_cred
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1541,14 +1625,16 @@ class TestInventoryUpdateCredentials(TestJobExecution):
     def test_vmware_source(self):
         vmware = CredentialType.defaults['vmware']()
         self.instance.source = 'vmware'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=vmware,
-            inputs = {'username': 'bob', 'password': 'secret', 'host': 'https://example.org'}
-        )
-        self.instance.credential.inputs['password'] = encrypt_field(
-            self.instance.credential, 'password'
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=vmware,
+                inputs = {'username': 'bob', 'password': 'secret', 'host': 'https://example.org'}
+            )
+            cred.inputs['password'] = encrypt_field(cred, 'password')
+            return cred
+        self.instance.get_cloud_credential = get_cred
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1567,17 +1653,21 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         azure_rm = CredentialType.defaults['azure_rm']()
         self.instance.source = 'azure_rm'
         self.instance.source_regions = 'north, south, east, west'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=azure_rm,
-            inputs = {
-                'client': 'some-client',
-                'secret': 'some-secret',
-                'tenant': 'some-tenant',
-                'subscription': 'some-subscription',
-                'cloud_environment': 'foobar'
-            }
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=azure_rm,
+                inputs = {
+                    'client': 'some-client',
+                    'secret': 'some-secret',
+                    'tenant': 'some-tenant',
+                    'subscription': 'some-subscription',
+                    'cloud_environment': 'foobar'
+                }
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1604,16 +1694,20 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         azure_rm = CredentialType.defaults['azure_rm']()
         self.instance.source = 'azure_rm'
         self.instance.source_regions = 'all'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=azure_rm,
-            inputs = {
-                'subscription': 'some-subscription',
-                'username': 'bob',
-                'password': 'secret',
-                'cloud_environment': 'foobar'
-            }
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=azure_rm,
+                inputs = {
+                    'subscription': 'some-subscription',
+                    'username': 'bob',
+                    'password': 'secret',
+                    'cloud_environment': 'foobar'
+                }
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1639,18 +1733,23 @@ class TestInventoryUpdateCredentials(TestJobExecution):
         gce = CredentialType.defaults['gce']()
         self.instance.source = 'gce'
         self.instance.source_regions = 'all'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=gce,
-            inputs = {
-                'username': 'bob',
-                'project': 'some-project',
-                'ssh_key_data': self.EXAMPLE_PRIVATE_KEY
-            }
-        )
-        self.instance.credential.inputs['ssh_key_data'] = encrypt_field(
-            self.instance.credential, 'ssh_key_data'
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=gce,
+                inputs = {
+                    'username': 'bob',
+                    'project': 'some-project',
+                    'ssh_key_data': self.EXAMPLE_PRIVATE_KEY
+                }
+            )
+            cred.inputs['ssh_key_data'] = encrypt_field(
+                cred, 'ssh_key_data'
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
+
         expected_gce_zone = ''
 
         def run_pexpect_side_effect(*args, **kwargs):
@@ -1678,19 +1777,23 @@ class TestInventoryUpdateCredentials(TestJobExecution):
     def test_openstack_source(self):
         openstack = CredentialType.defaults['openstack']()
         self.instance.source = 'openstack'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=openstack,
-            inputs = {
-                'username': 'bob',
-                'password': 'secret',
-                'project': 'tenant-name',
-                'host': 'https://keystone.example.org'
-            }
-        )
-        self.instance.credential.inputs['ssh_key_data'] = encrypt_field(
-            self.instance.credential, 'ssh_key_data'
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=openstack,
+                inputs = {
+                    'username': 'bob',
+                    'password': 'secret',
+                    'project': 'tenant-name',
+                    'host': 'https://keystone.example.org'
+                }
+            )
+            cred.inputs['ssh_key_data'] = encrypt_field(
+                cred, 'ssh_key_data'
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
 
         def run_pexpect_side_effect(*args, **kwargs):
             args, cwd, env, stdout = args
@@ -1713,18 +1816,23 @@ class TestInventoryUpdateCredentials(TestJobExecution):
     def test_satellite6_source(self):
         satellite6 = CredentialType.defaults['satellite6']()
         self.instance.source = 'satellite6'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=satellite6,
-            inputs = {
-                'username': 'bob',
-                'password': 'secret',
-                'host': 'https://example.org'
-            }
-        )
-        self.instance.credential.inputs['password'] = encrypt_field(
-            self.instance.credential, 'password'
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=satellite6,
+                inputs = {
+                    'username': 'bob',
+                    'password': 'secret',
+                    'host': 'https://example.org'
+                }
+            )
+            cred.inputs['password'] = encrypt_field(
+                cred, 'password'
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
+
         self.instance.source_vars = '{"satellite6_group_patterns": "[a,b,c]", "satellite6_group_prefix": "hey_"}'
 
         def run_pexpect_side_effect(*args, **kwargs):
@@ -1744,18 +1852,22 @@ class TestInventoryUpdateCredentials(TestJobExecution):
     def test_cloudforms_source(self):
         cloudforms = CredentialType.defaults['cloudforms']()
         self.instance.source = 'cloudforms'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=cloudforms,
-            inputs = {
-                'username': 'bob',
-                'password': 'secret',
-                'host': 'https://example.org'
-            }
-        )
-        self.instance.credential.inputs['password'] = encrypt_field(
-            self.instance.credential, 'password'
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=cloudforms,
+                inputs = {
+                    'username': 'bob',
+                    'password': 'secret',
+                    'host': 'https://example.org'
+                }
+            )
+            cred.inputs['password'] = encrypt_field(
+                cred, 'password'
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
 
         self.instance.source_vars = '{"prefer_ipv4": True}'
 
@@ -1780,14 +1892,19 @@ class TestInventoryUpdateCredentials(TestJobExecution):
     def test_awx_task_env(self):
         gce = CredentialType.defaults['gce']()
         self.instance.source = 'gce'
-        self.instance.credential = Credential(
-            pk=1,
-            credential_type=gce,
-            inputs = {
-                'username': 'bob',
-                'project': 'some-project',
-            }
-        )
+
+        def get_cred():
+            cred = Credential(
+                pk=1,
+                credential_type=gce,
+                inputs = {
+                    'username': 'bob',
+                    'project': 'some-project',
+                }
+            )
+            return cred
+        self.instance.get_cloud_credential = get_cred
+
         patch = mock.patch('awx.main.tasks.settings.AWX_TASK_ENV', {'FOO': 'BAR'})
         patch.start()
 

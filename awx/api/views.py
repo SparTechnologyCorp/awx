@@ -14,17 +14,17 @@ from base64 import b64encode
 from collections import OrderedDict, Iterable
 import six
 
+
 # Django
 from django.conf import settings
-from django.core.exceptions import FieldError
+from django.core.exceptions import FieldError, ObjectDoesNotExist
 from django.db.models import Q, Count, F
 from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
-from django.utils.encoding import smart_text, force_text
+from django.utils.encoding import smart_text
 from django.utils.safestring import mark_safe
 from django.utils.timezone import now
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.cache import never_cache
 from django.template.loader import render_to_string
 from django.http import HttpResponse
 from django.contrib.contenttypes.models import ContentType
@@ -53,6 +53,9 @@ import ansiconv
 # Python Social Auth
 from social_core.backends.utils import load_backends
 
+# Django OAuth Toolkit
+from oauth2_provider.models import get_access_token_model
+
 import pytz
 from wsgiref.util import FileWrapper
 
@@ -60,11 +63,10 @@ from wsgiref.util import FileWrapper
 from awx.main.tasks import send_notifications, handle_ha_toplogy_changes
 from awx.main.access import get_user_queryset
 from awx.main.ha import is_ha_environment
-from awx.api.authentication import TokenGetAuthentication
 from awx.api.filters import V1CredentialFilterBackend
 from awx.api.generics import get_view_name
 from awx.api.generics import * # noqa
-from awx.api.versioning import reverse, get_request_version
+from awx.api.versioning import reverse, get_request_version, drf_reverse
 from awx.conf.license import get_license, feature_enabled, feature_exists, LicenseForbids
 from awx.main.models import * # noqa
 from awx.main.utils import * # noqa
@@ -80,7 +82,6 @@ from awx.api.permissions import * # noqa
 from awx.api.renderers import * # noqa
 from awx.api.serializers import * # noqa
 from awx.api.metadata import RoleMetadata, JobTypeMetadata
-from awx.main.consumers import emit_channel_notification
 from awx.main.models.unified_jobs import ACTIVE_STATES
 from awx.main.scheduler.tasks import run_job_complete
 
@@ -185,7 +186,6 @@ class InstanceGroupMembershipMixin(object):
 
 class ApiRootView(APIView):
 
-    authentication_classes = []
     permission_classes = (AllowAny,)
     view_name = _('REST API')
     versioning_class = None
@@ -204,19 +204,32 @@ class ApiRootView(APIView):
         if feature_enabled('rebranding'):
             data['custom_logo'] = settings.CUSTOM_LOGO
             data['custom_login_info'] = settings.CUSTOM_LOGIN_INFO
+        data['oauth2'] = drf_reverse('api:oauth_authorization_root_view')
+        return Response(data)
+
+
+class ApiOAuthAuthorizationRootView(APIView):
+
+    permission_classes = (AllowAny,)
+    view_name = _("API OAuth Authorization Root")
+    versioning_class = None
+
+    def get(self, request, format=None):
+        data = OrderedDict()
+        data['authorize'] = drf_reverse('api:authorize')
+        data['token'] = drf_reverse('api:token')
+        data['revoke_token'] = drf_reverse('api:revoke-token')
         return Response(data)
 
 
 class ApiVersionRootView(APIView):
 
-    authentication_classes = []
     permission_classes = (AllowAny,)
     swagger_topic = 'Versioning'
 
     def get(self, request, format=None):
         ''' List top level resources '''
         data = OrderedDict()
-        data['authtoken'] = reverse('api:auth_token_view', request=request)
         data['ping'] = reverse('api:api_v1_ping_view', request=request)
         data['instances'] = reverse('api:instance_list', request=request)
         data['instance_groups'] = reverse('api:instance_group_list', request=request)
@@ -232,6 +245,8 @@ class ApiVersionRootView(APIView):
         data['credentials'] = reverse('api:credential_list', request=request)
         if get_request_version(request) > 1:
             data['credential_types'] = reverse('api:credential_type_list', request=request)
+            data['applications'] = reverse('api:o_auth2_application_list', request=request)
+            data['tokens'] = reverse('api:o_auth2_token_list', request=request)
         data['inventory'] = reverse('api:inventory_list', request=request)
         data['inventory_scripts'] = reverse('api:inventory_script_list', request=request)
         data['inventory_sources'] = reverse('api:inventory_source_list', request=request)
@@ -265,8 +280,6 @@ class ApiV1RootView(ApiVersionRootView):
 
 class ApiV2RootView(ApiVersionRootView):
     view_name = _('Version 2')
-    new_in_320 = True
-    new_in_api_v2 = True
 
 
 class ApiV1PingView(APIView):
@@ -276,7 +289,6 @@ class ApiV1PingView(APIView):
     permission_classes = (AllowAny,)
     authentication_classes = ()
     view_name = _('Ping')
-    new_in_210 = True
     swagger_topic = 'System Configuration'
 
     def get(self, request, format=None):
@@ -410,7 +422,6 @@ class ApiV1ConfigView(APIView):
 class DashboardView(APIView):
 
     view_name = _("Dashboard")
-    new_in_14 = True
     swagger_topic = 'Dashboard'
 
     def get(self, request, format=None):
@@ -510,7 +521,6 @@ class DashboardView(APIView):
 class DashboardJobsGraphView(APIView):
 
     view_name = _("Dashboard Jobs Graphs")
-    new_in_200 = True
     swagger_topic = 'Jobs'
 
     def get(self, request, format=None):
@@ -563,7 +573,6 @@ class InstanceList(ListAPIView):
     view_name = _("Instances")
     model = Instance
     serializer_class = InstanceSerializer
-    new_in_320 = True
 
 
 class InstanceDetail(RetrieveUpdateAPIView):
@@ -571,7 +580,6 @@ class InstanceDetail(RetrieveUpdateAPIView):
     view_name = _("Instance Detail")
     model = Instance
     serializer_class = InstanceSerializer
-    new_in_320 = True
 
 
     def update(self, request, *args, **kwargs):
@@ -594,7 +602,6 @@ class InstanceUnifiedJobsList(SubListAPIView):
     model = UnifiedJob
     serializer_class = UnifiedJobSerializer
     parent_model = Instance
-    new_in_320 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -609,7 +616,6 @@ class InstanceInstanceGroupsList(InstanceGroupMembershipMixin, SubListCreateAtta
     model = InstanceGroup
     serializer_class = InstanceGroupSerializer
     parent_model = Instance
-    new_in_320 = True
     relationship = 'rampart_groups'
 
 
@@ -618,7 +624,6 @@ class InstanceGroupList(ListCreateAPIView):
     view_name = _("Instance Groups")
     model = InstanceGroup
     serializer_class = InstanceGroupSerializer
-    new_in_320 = True
 
 
 class InstanceGroupDetail(RetrieveUpdateDestroyAPIView):
@@ -626,7 +631,6 @@ class InstanceGroupDetail(RetrieveUpdateDestroyAPIView):
     view_name = _("Instance Group Detail")
     model = InstanceGroup
     serializer_class = InstanceGroupSerializer
-    new_in_320 = True
 
 
 class InstanceGroupUnifiedJobsList(SubListAPIView):
@@ -636,7 +640,6 @@ class InstanceGroupUnifiedJobsList(SubListAPIView):
     serializer_class = UnifiedJobSerializer
     parent_model = InstanceGroup
     relationship = "unifiedjob_set"
-    new_in_320 = True
 
 
 class InstanceGroupInstanceList(InstanceGroupMembershipMixin, SubListAttachDetachAPIView):
@@ -645,7 +648,6 @@ class InstanceGroupInstanceList(InstanceGroupMembershipMixin, SubListAttachDetac
     model = Instance
     serializer_class = InstanceSerializer
     parent_model = InstanceGroup
-    new_in_320 = True
     relationship = "instances"
 
 
@@ -654,14 +656,12 @@ class ScheduleList(ListAPIView):
     view_name = _("Schedules")
     model = Schedule
     serializer_class = ScheduleSerializer
-    new_in_148 = True
 
 
 class ScheduleDetail(RetrieveUpdateDestroyAPIView):
 
     model = Schedule
     serializer_class = ScheduleSerializer
-    new_in_148 = True
 
 
 class SchedulePreview(GenericAPIView):
@@ -669,7 +669,6 @@ class SchedulePreview(GenericAPIView):
     model = Schedule
     view_name = _('Schedule Recurrence Rule Preview')
     serializer_class = SchedulePreviewSerializer
-    new_in_api_v2 = True
 
     def post(self, request):
         serializer = self.get_serializer(data=request.data)
@@ -700,7 +699,10 @@ class ScheduleZoneInfo(APIView):
 
     def get(self, request):
         from dateutil.zoneinfo import get_zonefile_instance
-        return Response(sorted(get_zonefile_instance().zones.keys()))
+        return Response([
+            {'name': zone}
+            for zone in sorted(get_zonefile_instance().zones)
+        ])
 
 
 class LaunchConfigCredentialsBase(SubListAttachDetachAPIView):
@@ -739,8 +741,6 @@ class LaunchConfigCredentialsBase(SubListAttachDetachAPIView):
 class ScheduleCredentialsList(LaunchConfigCredentialsBase):
 
     parent_model = Schedule
-    new_in_330 = True
-    new_in_api_v2 = True
 
 
 class ScheduleUnifiedJobsList(SubListAPIView):
@@ -750,7 +750,6 @@ class ScheduleUnifiedJobsList(SubListAPIView):
     parent_model = Schedule
     relationship = 'unifiedjob_set'
     view_name = _('Schedule Jobs List')
-    new_in_148 = True
 
 
 class AuthView(APIView):
@@ -758,7 +757,6 @@ class AuthView(APIView):
 
     authentication_classes = []
     permission_classes = (AllowAny,)
-    new_in_240 = True
     swagger_topic = 'System Configuration'
 
     def get(self, request):
@@ -796,78 +794,6 @@ class AuthView(APIView):
                 data[name] = backend_data
         return Response(data)
 
-
-class AuthTokenView(APIView):
-
-    authentication_classes = []
-    permission_classes = (AllowAny,)
-    serializer_class = AuthTokenSerializer
-    model = AuthToken
-    swagger_topic = 'Authentication'
-
-    def get_serializer(self, *args, **kwargs):
-        serializer = self.serializer_class(*args, **kwargs)
-        # Override when called from browsable API to generate raw data form;
-        # update serializer "validated" data to be displayed by the raw data
-        # form.
-        if hasattr(self, '_raw_data_form_marker'):
-            # Always remove read only fields from serializer.
-            for name, field in serializer.fields.items():
-                if getattr(field, 'read_only', None):
-                    del serializer.fields[name]
-            serializer._data = self.update_raw_data(serializer.data)
-        return serializer
-
-    @never_cache
-    def post(self, request):
-        serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            request_hash = AuthToken.get_request_hash(self.request)
-            try:
-                token = AuthToken.objects.filter(user=serializer.validated_data['user'],
-                                                 request_hash=request_hash,
-                                                 expires__gt=now(),
-                                                 reason='')[0]
-                token.refresh()
-                if 'username' in request.data:
-                    logger.info(smart_text(u"User {} logged in".format(request.data['username'])),
-                                extra=dict(actor=request.data['username']))
-            except IndexError:
-                token = AuthToken.objects.create(user=serializer.validated_data['user'],
-                                                 request_hash=request_hash)
-                if 'username' in request.data:
-                    logger.info(smart_text(u"User {} logged in".format(request.data['username'])),
-                                extra=dict(actor=request.data['username']))
-                # Get user un-expired tokens that are not invalidated that are
-                # over the configured limit.
-                # Mark them as invalid and inform the user
-                invalid_tokens = AuthToken.get_tokens_over_limit(serializer.validated_data['user'])
-                for t in invalid_tokens:
-                    emit_channel_notification('control-limit_reached', dict(group_name='control',
-                                                                            reason=force_text(AuthToken.reason_long('limit_reached')),
-                                                                            token_key=t.key))
-                    t.invalidate(reason='limit_reached')
-
-            # Note: This header is normally added in the middleware whenever an
-            # auth token is included in the request header.
-            headers = {
-                'Auth-Token-Timeout': int(settings.AUTH_TOKEN_EXPIRATION),
-                'Pragma': 'no-cache',
-            }
-            return Response({'token': token.key, 'expires': token.expires}, headers=headers)
-        if 'username' in request.data:
-            logger.warning(smart_text(u"Login failed for user {}".format(request.data['username'])),
-                           extra=dict(actor=request.data['username']))
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    def delete(self, request):
-        if 'HTTP_AUTHORIZATION' in request.META:
-            token_match = re.match("Token\s(.+)", request.META['HTTP_AUTHORIZATION'])
-            if token_match:
-                filter_tokens = AuthToken.objects.filter(key=token_match.groups()[0])
-                if filter_tokens.exists():
-                    filter_tokens[0].invalidate()
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class OrganizationCountsMixin(object):
@@ -1080,7 +1006,6 @@ class OrganizationWorkflowJobTemplatesList(SubListCreateAttachDetachAPIView):
     parent_model = Organization
     relationship = 'workflows'
     parent_key = 'organization'
-    new_in_310 = True
 
 
 class OrganizationTeamsList(SubListCreateAttachDetachAPIView):
@@ -1098,7 +1023,6 @@ class OrganizationActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIV
     serializer_class = ActivityStreamSerializer
     parent_model = Organization
     relationship = 'activitystream_set'
-    new_in_145 = True
 
 
 class OrganizationNotificationTemplatesList(SubListCreateAttachDetachAPIView):
@@ -1116,7 +1040,6 @@ class OrganizationNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView)
     serializer_class = NotificationTemplateSerializer
     parent_model = Organization
     relationship = 'notification_templates_any'
-    new_in_300 = True
 
 
 class OrganizationNotificationTemplatesErrorList(SubListCreateAttachDetachAPIView):
@@ -1125,7 +1048,6 @@ class OrganizationNotificationTemplatesErrorList(SubListCreateAttachDetachAPIVie
     serializer_class = NotificationTemplateSerializer
     parent_model = Organization
     relationship = 'notification_templates_error'
-    new_in_300 = True
 
 
 class OrganizationNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIView):
@@ -1134,7 +1056,6 @@ class OrganizationNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIV
     serializer_class = NotificationTemplateSerializer
     parent_model = Organization
     relationship = 'notification_templates_success'
-    new_in_300 = True
 
 
 class OrganizationInstanceGroupsList(SubListAttachDetachAPIView):
@@ -1143,14 +1064,12 @@ class OrganizationInstanceGroupsList(SubListAttachDetachAPIView):
     serializer_class = InstanceGroupSerializer
     parent_model = Organization
     relationship = 'instance_groups'
-    new_in_320 = True
 
 
 class OrganizationAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = Organization
-    new_in_300 = True
 
 
 class OrganizationObjectRolesList(SubListAPIView):
@@ -1158,7 +1077,6 @@ class OrganizationObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = Organization
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -1198,7 +1116,6 @@ class TeamRolesList(SubListAttachDetachAPIView):
     metadata_class = RoleMetadata
     parent_model = Team
     relationship='member_role.children'
-    new_in_300 = True
 
     def get_queryset(self):
         team = get_object_or_404(Team, pk=self.kwargs['pk'])
@@ -1236,7 +1153,6 @@ class TeamObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = Team
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -1268,7 +1184,6 @@ class TeamActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
     serializer_class = ActivityStreamSerializer
     parent_model = Team
     relationship = 'activitystream_set'
-    new_in_145 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -1284,7 +1199,6 @@ class TeamAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = Team
-    new_in_300 = True
 
 
 class ProjectList(ListCreateAPIView):
@@ -1357,7 +1271,6 @@ class ProjectSchedulesList(SubListCreateAPIView):
     parent_model = Project
     relationship = 'schedules'
     parent_key = 'unified_job_template'
-    new_in_148 = True
 
 
 class ProjectScmInventorySources(SubListAPIView):
@@ -1368,7 +1281,6 @@ class ProjectScmInventorySources(SubListAPIView):
     parent_model = Project
     relationship = 'scm_inventory_sources'
     parent_key = 'source_project'
-    new_in_320 = True
 
 
 class ProjectActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -1377,7 +1289,6 @@ class ProjectActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
     serializer_class = ActivityStreamSerializer
     parent_model = Project
     relationship = 'activitystream_set'
-    new_in_145 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -1396,7 +1307,6 @@ class ProjectNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView):
     serializer_class = NotificationTemplateSerializer
     parent_model = Project
     relationship = 'notification_templates_any'
-    new_in_300 = True
 
 
 class ProjectNotificationTemplatesErrorList(SubListCreateAttachDetachAPIView):
@@ -1405,7 +1315,6 @@ class ProjectNotificationTemplatesErrorList(SubListCreateAttachDetachAPIView):
     serializer_class = NotificationTemplateSerializer
     parent_model = Project
     relationship = 'notification_templates_error'
-    new_in_300 = True
 
 
 class ProjectNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIView):
@@ -1414,7 +1323,6 @@ class ProjectNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIView):
     serializer_class = NotificationTemplateSerializer
     parent_model = Project
     relationship = 'notification_templates_success'
-    new_in_300 = True
 
 
 class ProjectUpdatesList(SubListAPIView):
@@ -1423,7 +1331,6 @@ class ProjectUpdatesList(SubListAPIView):
     serializer_class = ProjectUpdateSerializer
     parent_model = Project
     relationship = 'project_updates'
-    new_in_13 = True
 
 
 class ProjectUpdateView(RetrieveAPIView):
@@ -1431,7 +1338,6 @@ class ProjectUpdateView(RetrieveAPIView):
     model = Project
     serializer_class = ProjectUpdateViewSerializer
     permission_classes = (ProjectUpdatePermission,)
-    new_in_13 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -1455,14 +1361,12 @@ class ProjectUpdateList(ListAPIView):
 
     model = ProjectUpdate
     serializer_class = ProjectUpdateListSerializer
-    new_in_13 = True
 
 
 class ProjectUpdateDetail(UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
 
     model = ProjectUpdate
     serializer_class = ProjectUpdateSerializer
-    new_in_13 = True
 
 
 class ProjectUpdateEventsList(SubListAPIView):
@@ -1509,7 +1413,6 @@ class ProjectUpdateCancel(RetrieveAPIView):
     model = ProjectUpdate
     obj_permission_type = 'cancel'
     serializer_class = ProjectUpdateCancelSerializer
-    new_in_13 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -1526,7 +1429,6 @@ class ProjectUpdateNotificationsList(SubListAPIView):
     serializer_class = NotificationSerializer
     parent_model = ProjectUpdate
     relationship = 'notifications'
-    new_in_300 = True
 
 
 class ProjectUpdateScmInventoryUpdates(SubListCreateAPIView):
@@ -1537,14 +1439,12 @@ class ProjectUpdateScmInventoryUpdates(SubListCreateAPIView):
     parent_model = ProjectUpdate
     relationship = 'scm_inventory_updates'
     parent_key = 'source_project_update'
-    new_in_320 = True
 
 
 class ProjectAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = Project
-    new_in_300 = True
 
 
 class ProjectObjectRolesList(SubListAPIView):
@@ -1552,12 +1452,17 @@ class ProjectObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = Project
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
         content_type = ContentType.objects.get_for_model(self.parent_model)
         return Role.objects.filter(content_type=content_type, object_id=po.pk)
+
+
+class ProjectCopy(CopyAPIView):
+
+    model = Project
+    copy_return_serializer_class = ProjectSerializer
 
 
 class UserList(ListCreateAPIView):
@@ -1592,6 +1497,107 @@ class UserMeList(ListAPIView):
         return self.model.objects.filter(pk=self.request.user.pk)
 
 
+class OAuth2ApplicationList(ListCreateAPIView):
+
+    view_name = _("OAuth Applications")
+
+    model = OAuth2Application
+    serializer_class = OAuth2ApplicationSerializer
+
+
+class OAuth2ApplicationDetail(RetrieveUpdateDestroyAPIView):
+
+    view_name = _("OAuth Application Detail")
+
+    model = OAuth2Application
+    serializer_class = OAuth2ApplicationSerializer
+
+
+class ApplicationOAuth2TokenList(SubListCreateAPIView):
+
+    view_name = _("OAuth Application Tokens")
+
+    model = OAuth2AccessToken
+    serializer_class = OAuth2TokenSerializer
+    parent_model = OAuth2Application
+    relationship = 'oauth2accesstoken_set'
+    parent_key = 'application'
+
+
+class OAuth2ApplicationActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
+
+    model = ActivityStream
+    serializer_class = ActivityStreamSerializer
+    parent_model = OAuth2Application
+    relationship = 'activitystream_set'
+
+
+class OAuth2TokenList(ListCreateAPIView):
+
+    view_name = _("OAuth2 Tokens")
+
+    model = OAuth2AccessToken
+    serializer_class = OAuth2TokenSerializer
+    
+    
+class OAuth2AuthorizedTokenList(SubListCreateAPIView):
+
+    view_name = _("OAuth2 Authorized Access Tokens")
+    
+    model = OAuth2AccessToken
+    serializer_class = OAuth2AuthorizedTokenSerializer
+    parent_model = OAuth2Application
+    relationship = 'oauth2accesstoken_set'
+    parent_key = 'application'
+
+    def get_queryset(self):
+        return get_access_token_model().objects.filter(application__isnull=False, user=self.request.user)
+        
+        
+class UserAuthorizedTokenList(SubListCreateAPIView):
+
+    view_name = _("OAuth2 User Authorized Access Tokens")
+    
+    model = OAuth2AccessToken
+    serializer_class = OAuth2AuthorizedTokenSerializer
+    parent_model = User
+    relationship = 'oauth2accesstoken_set'
+    parent_key = 'user'
+
+    def get_queryset(self):
+        return get_access_token_model().objects.filter(application__isnull=False, user=self.request.user)
+
+
+class OAuth2PersonalTokenList(SubListCreateAPIView):
+    
+    view_name = _("OAuth2 Personal Access Tokens")
+    
+    model = OAuth2AccessToken
+    serializer_class = OAuth2PersonalTokenSerializer
+    parent_model = User
+    relationship = 'main_oauth2accesstoken'
+    parent_key = 'user'
+    
+    def get_queryset(self):
+        return get_access_token_model().objects.filter(application__isnull=True, user=self.request.user)
+
+
+class OAuth2TokenDetail(RetrieveUpdateDestroyAPIView):
+
+    view_name = _("OAuth Token Detail")
+
+    model = OAuth2AccessToken
+    serializer_class = OAuth2TokenSerializer
+
+
+class OAuth2TokenActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
+
+    model = ActivityStream
+    serializer_class = ActivityStreamSerializer
+    parent_model = OAuth2AccessToken
+    relationship = 'activitystream_set'
+
+
 class UserTeamsList(ListAPIView):
 
     model = User
@@ -1613,7 +1619,6 @@ class UserRolesList(SubListAttachDetachAPIView):
     parent_model = User
     relationship='roles'
     permission_classes = (IsAuthenticated,)
-    new_in_300 = True
 
     def get_queryset(self):
         u = get_object_or_404(User, pk=self.kwargs['pk'])
@@ -1706,7 +1711,6 @@ class UserActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
     serializer_class = ActivityStreamSerializer
     parent_model = User
     relationship = 'activitystream_set'
-    new_in_145 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -1757,23 +1761,18 @@ class UserAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = User
-    new_in_300 = True
 
 
 class CredentialTypeList(ListCreateAPIView):
 
     model = CredentialType
     serializer_class = CredentialTypeSerializer
-    new_in_320 = True
-    new_in_api_v2 = True
 
 
 class CredentialTypeDetail(RetrieveUpdateDestroyAPIView):
 
     model = CredentialType
     serializer_class = CredentialTypeSerializer
-    new_in_320 = True
-    new_in_api_v2 = True
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1790,8 +1789,6 @@ class CredentialTypeCredentialList(SubListAPIView):
     parent_model = CredentialType
     relationship = 'credentials'
     serializer_class = CredentialSerializer
-    new_in_320 = True
-    new_in_api_v2 = True
 
 
 class CredentialTypeActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -1800,8 +1797,6 @@ class CredentialTypeActivityStreamList(ActivityStreamEnforcementMixin, SubListAP
     serializer_class = ActivityStreamSerializer
     parent_model = CredentialType
     relationship = 'activitystream_set'
-    new_in_320 = True
-    new_in_api_v2 = True
 
 
 # remove in 3.3
@@ -1829,7 +1824,6 @@ class CredentialOwnerUsersList(SubListAPIView):
     serializer_class = UserSerializer
     parent_model = Credential
     relationship = 'admin_role.members'
-    new_in_300 = True
 
 
 class CredentialOwnerTeamsList(SubListAPIView):
@@ -1837,7 +1831,6 @@ class CredentialOwnerTeamsList(SubListAPIView):
     model = Team
     serializer_class = TeamSerializer
     parent_model = Credential
-    new_in_300 = True
 
     def get_queryset(self):
         credential = get_object_or_404(self.parent_model, pk=self.kwargs['pk'])
@@ -1918,14 +1911,12 @@ class CredentialActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIVie
     serializer_class = ActivityStreamSerializer
     parent_model = Credential
     relationship = 'activitystream_set'
-    new_in_145 = True
 
 
 class CredentialAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = Credential
-    new_in_300 = True
 
 
 class CredentialObjectRolesList(SubListAPIView):
@@ -1933,7 +1924,6 @@ class CredentialObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = Credential
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -1941,18 +1931,22 @@ class CredentialObjectRolesList(SubListAPIView):
         return Role.objects.filter(content_type=content_type, object_id=po.pk)
 
 
+class CredentialCopy(CopyAPIView):
+
+    model = Credential
+    copy_return_serializer_class = CredentialSerializer
+
+
 class InventoryScriptList(ListCreateAPIView):
 
     model = CustomInventoryScript
     serializer_class = CustomInventoryScriptSerializer
-    new_in_210 = True
 
 
 class InventoryScriptDetail(RetrieveUpdateDestroyAPIView):
 
     model = CustomInventoryScript
     serializer_class = CustomInventoryScriptSerializer
-    new_in_210 = True
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1970,12 +1964,17 @@ class InventoryScriptObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = CustomInventoryScript
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
         content_type = ContentType.objects.get_for_model(self.parent_model)
         return Role.objects.filter(content_type=content_type, object_id=po.pk)
+
+
+class InventoryScriptCopy(CopyAPIView):
+
+    model = CustomInventoryScript
+    copy_return_serializer_class = CustomInventoryScriptSerializer
 
 
 class InventoryList(ListCreateAPIView):
@@ -2042,7 +2041,7 @@ class InventoryDetail(ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
         try:
             obj.schedule_deletion(getattr(request.user, 'id', None))
             return Response(status=status.HTTP_202_ACCEPTED)
-        except RuntimeError, e:
+        except RuntimeError as e:
             return Response(dict(error=_("{0}".format(e))), status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -2052,7 +2051,6 @@ class InventoryActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView
     serializer_class = ActivityStreamSerializer
     parent_model = Inventory
     relationship = 'activitystream_set'
-    new_in_145 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -2067,14 +2065,12 @@ class InventoryInstanceGroupsList(SubListAttachDetachAPIView):
     serializer_class = InstanceGroupSerializer
     parent_model = Inventory
     relationship = 'instance_groups'
-    new_in_320 = True
 
 
 class InventoryAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = Inventory
-    new_in_300 = True
 
 
 class InventoryObjectRolesList(SubListAPIView):
@@ -2082,7 +2078,6 @@ class InventoryObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = Inventory
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -2096,13 +2091,18 @@ class InventoryJobTemplateList(SubListAPIView):
     serializer_class = JobTemplateSerializer
     parent_model = Inventory
     relationship = 'jobtemplates'
-    new_in_300 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
         self.check_parent_access(parent)
         qs = self.request.user.get_queryset(self.model)
         return qs.filter(inventory=parent)
+
+
+class InventoryCopy(CopyAPIView):
+
+    model = Inventory
+    copy_return_serializer_class = InventorySerializer
 
 
 class HostRelatedSearchMixin(object):
@@ -2134,7 +2134,7 @@ class HostList(HostRelatedSearchMixin, ListCreateAPIView):
         try:
             return super(HostList, self).list(*args, **kwargs)
         except Exception as e:
-            return Response(dict(error=_(unicode(e))), status=status.HTTP_400_BAD_REQUEST)
+            return Response(dict(error=_(six.text_type(e))), status=status.HTTP_400_BAD_REQUEST)
 
 
 class HostDetail(ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
@@ -2148,8 +2148,6 @@ class HostAnsibleFactsDetail(RetrieveAPIView):
 
     model = Host
     serializer_class = AnsibleFactsSerializer
-    new_in_320 = True
-    new_in_api_v2 = True
 
 
 class InventoryHostsList(HostRelatedSearchMixin, SubListCreateAttachDetachAPIView):
@@ -2210,7 +2208,6 @@ class HostInventorySourcesList(SubListAPIView):
     serializer_class = InventorySourceSerializer
     parent_model = Host
     relationship = 'inventory_sources'
-    new_in_148 = True
 
 
 class HostSmartInventoriesList(SubListAPIView):
@@ -2218,7 +2215,6 @@ class HostSmartInventoriesList(SubListAPIView):
     serializer_class = InventorySerializer
     parent_model = Host
     relationship = 'smart_inventories'
-    new_in_320 = True
 
 
 class HostActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -2227,7 +2223,6 @@ class HostActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
     serializer_class = ActivityStreamSerializer
     parent_model = Host
     relationship = 'activitystream_set'
-    new_in_145 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -2241,7 +2236,6 @@ class HostFactVersionsList(SystemTrackingEnforcementMixin, ParentMixin, ListAPIV
     model = Fact
     serializer_class = FactVersionSerializer
     parent_model = Host
-    new_in_220 = True
 
     def get_queryset(self):
         from_spec = self.request.query_params.get('from', None)
@@ -2265,7 +2259,6 @@ class HostFactVersionsList(SystemTrackingEnforcementMixin, ParentMixin, ListAPIV
 class HostFactCompareView(SystemTrackingEnforcementMixin, SubDetailAPIView):
 
     model = Fact
-    new_in_220 = True
     parent_model = Host
     serializer_class = FactSerializer
 
@@ -2286,8 +2279,6 @@ class HostInsights(GenericAPIView):
 
     model = Host
     serializer_class = EmptySerializer
-    new_in_320 = True
-    new_in_api_v2 = True
 
     def _extract_insights_creds(self, credential):
         return (credential.inputs['username'], decrypt_field(credential, 'password'))
@@ -2409,7 +2400,6 @@ class GroupPotentialChildrenList(SubListAPIView):
     model = Group
     serializer_class = GroupSerializer
     parent_model = Group
-    new_in_14 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -2474,7 +2464,6 @@ class GroupInventorySourcesList(SubListAPIView):
     serializer_class = InventorySourceSerializer
     parent_model = Group
     relationship = 'inventory_sources'
-    new_in_148 = True
 
 
 class GroupActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -2483,7 +2472,6 @@ class GroupActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
     serializer_class = ActivityStreamSerializer
     parent_model = Group
     relationship = 'activitystream_set'
-    new_in_145 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -2590,7 +2578,6 @@ class InventoryTreeView(RetrieveAPIView):
     model = Inventory
     serializer_class = GroupTreeSerializer
     filter_backends = ()
-    new_in_13 = True
 
     def _populate_group_children(self, group_data, all_group_data_map, group_children_map):
         if 'children' in group_data:
@@ -2628,7 +2615,6 @@ class InventoryInventorySourcesList(SubListCreateAPIView):
     always_allow_superuser = False
     relationship = 'inventory_sources'
     parent_key = 'inventory'
-    new_in_320 = True
 
 
 class InventoryInventorySourcesUpdate(RetrieveAPIView):
@@ -2638,7 +2624,6 @@ class InventoryInventorySourcesUpdate(RetrieveAPIView):
     obj_permission_type = 'start'
     serializer_class = InventorySourceUpdateSerializer
     permission_classes = (InventoryInventorySourcesUpdatePermission,)
-    new_in_320 = True
 
     def retrieve(self, request, *args, **kwargs):
         inventory = self.get_object()
@@ -2686,7 +2671,6 @@ class InventorySourceList(ListCreateAPIView):
     model = InventorySource
     serializer_class = InventorySourceSerializer
     always_allow_superuser = False
-    new_in_320 = True
 
     @property
     def allowed_methods(self):
@@ -2700,7 +2684,6 @@ class InventorySourceDetail(RetrieveUpdateDestroyAPIView):
 
     model = InventorySource
     serializer_class = InventorySourceSerializer
-    new_in_14 = True
 
     def destroy(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -2721,7 +2704,6 @@ class InventorySourceSchedulesList(SubListCreateAPIView):
     parent_model = InventorySource
     relationship = 'schedules'
     parent_key = 'unified_job_template'
-    new_in_148 = True
 
 
 class InventorySourceActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -2730,7 +2712,6 @@ class InventorySourceActivityStreamList(ActivityStreamEnforcementMixin, SubListA
     serializer_class = ActivityStreamSerializer
     parent_model = InventorySource
     relationship = 'activitystream_set'
-    new_in_145 = True
 
 
 class InventorySourceNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView):
@@ -2739,7 +2720,6 @@ class InventorySourceNotificationTemplatesAnyList(SubListCreateAttachDetachAPIVi
     serializer_class = NotificationTemplateSerializer
     parent_model = InventorySource
     relationship = 'notification_templates_any'
-    new_in_300 = True
 
     def post(self, request, *args, **kwargs):
         parent = self.get_parent_object()
@@ -2766,7 +2746,6 @@ class InventorySourceHostsList(HostRelatedSearchMixin, SubListDestroyAPIView):
     serializer_class = HostSerializer
     parent_model = InventorySource
     relationship = 'hosts'
-    new_in_148 = True
     check_sub_obj_permission = False
     capabilities_prefetch = ['inventory.admin']
 
@@ -2777,7 +2756,6 @@ class InventorySourceGroupsList(SubListDestroyAPIView):
     serializer_class = GroupSerializer
     parent_model = InventorySource
     relationship = 'groups'
-    new_in_148 = True
     check_sub_obj_permission = False
 
 
@@ -2787,7 +2765,28 @@ class InventorySourceUpdatesList(SubListAPIView):
     serializer_class = InventoryUpdateSerializer
     parent_model = InventorySource
     relationship = 'inventory_updates'
-    new_in_14 = True
+
+
+class InventorySourceCredentialsList(SubListAttachDetachAPIView):
+
+    parent_model = InventorySource
+    model = Credential
+    serializer_class = CredentialSerializer
+    relationship = 'credentials'
+
+    def is_valid_relation(self, parent, sub, created=False):
+        error = InventorySource.cloud_credential_validation(parent.source, sub)
+        if error:
+            return {'msg': error}
+        if sub.credential_type == 'vault':
+            # TODO: support this
+            return {"msg": _("Vault credentials are not yet supported for inventory sources.")}
+        else:
+            # Cloud credentials are exclusive with all other cloud credentials
+            cloud_cred_qs = parent.credentials.exclude(credential_type__kind='vault')
+            if cloud_cred_qs.exists():
+                return {'msg': _("Source already has cloud credential assigned.")}
+        return None
 
 
 class InventorySourceUpdateView(RetrieveAPIView):
@@ -2795,7 +2794,6 @@ class InventorySourceUpdateView(RetrieveAPIView):
     model = InventorySource
     obj_permission_type = 'start'
     serializer_class = InventorySourceUpdateSerializer
-    new_in_14 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -2823,7 +2821,14 @@ class InventoryUpdateDetail(UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
 
     model = InventoryUpdate
     serializer_class = InventoryUpdateSerializer
-    new_in_14 = True
+
+
+class InventoryUpdateCredentialsList(SubListAPIView):
+
+    parent_model = InventoryUpdate
+    model = Credential
+    serializer_class = CredentialSerializer
+    relationship = 'credentials'
 
 
 class InventoryUpdateCancel(RetrieveAPIView):
@@ -2831,7 +2836,6 @@ class InventoryUpdateCancel(RetrieveAPIView):
     model = InventoryUpdate
     obj_permission_type = 'cancel'
     serializer_class = InventoryUpdateCancelSerializer
-    new_in_14 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -2848,7 +2852,6 @@ class InventoryUpdateNotificationsList(SubListAPIView):
     serializer_class = NotificationSerializer
     parent_model = InventoryUpdate
     relationship = 'notifications'
-    new_in_300 = True
 
 
 class JobTemplateList(ListCreateAPIView):
@@ -2955,6 +2958,7 @@ class JobTemplateLaunch(RetrieveAPIView):
         ):
             # make a list of the current credentials
             existing_credentials = obj.credentials.all()
+            template_credentials = list(existing_credentials)  # save copy of existing
             new_credentials = []
             for key, conditional in (
                 ('credential', lambda cred: cred.credential_type.kind != 'ssh'),
@@ -2981,6 +2985,11 @@ class JobTemplateLaunch(RetrieveAPIView):
             # combine the list of "new" and the filtered list of "old"
             new_credentials.extend([cred.pk for cred in existing_credentials])
             if new_credentials:
+                # If provided list doesn't contain the pre-existing credentials
+                # defined on the template, add them back here
+                for cred_obj in template_credentials:
+                    if cred_obj.pk not in new_credentials:
+                        new_credentials.append(cred_obj.pk)
                 modern_data['credentials'] = new_credentials
 
         # credential passwords were historically provided as top-level attributes
@@ -3058,7 +3067,6 @@ class JobTemplateSchedulesList(SubListCreateAPIView):
     parent_model = JobTemplate
     relationship = 'schedules'
     parent_key = 'unified_job_template'
-    new_in_148 = True
 
 
 class JobTemplateSurveySpec(GenericAPIView):
@@ -3066,7 +3074,6 @@ class JobTemplateSurveySpec(GenericAPIView):
     model = JobTemplate
     obj_permission_type = 'admin'
     serializer_class = EmptySerializer
-    new_in_210 = True
 
     def get(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -3173,7 +3180,6 @@ class JobTemplateSurveySpec(GenericAPIView):
 class WorkflowJobTemplateSurveySpec(WorkflowsEnforcementMixin, JobTemplateSurveySpec):
 
     model = WorkflowJobTemplate
-    new_in_310 = True
 
 
 class JobTemplateActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -3182,7 +3188,6 @@ class JobTemplateActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIVi
     serializer_class = ActivityStreamSerializer
     parent_model = JobTemplate
     relationship = 'activitystream_set'
-    new_in_145 = True
 
 
 class JobTemplateNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView):
@@ -3191,7 +3196,6 @@ class JobTemplateNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView):
     serializer_class = NotificationTemplateSerializer
     parent_model = JobTemplate
     relationship = 'notification_templates_any'
-    new_in_300 = True
 
 
 class JobTemplateNotificationTemplatesErrorList(SubListCreateAttachDetachAPIView):
@@ -3200,7 +3204,6 @@ class JobTemplateNotificationTemplatesErrorList(SubListCreateAttachDetachAPIView
     serializer_class = NotificationTemplateSerializer
     parent_model = JobTemplate
     relationship = 'notification_templates_error'
-    new_in_300 = True
 
 
 class JobTemplateNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIView):
@@ -3209,7 +3212,6 @@ class JobTemplateNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIVi
     serializer_class = NotificationTemplateSerializer
     parent_model = JobTemplate
     relationship = 'notification_templates_success'
-    new_in_300 = True
 
 
 class JobTemplateCredentialsList(SubListCreateAttachDetachAPIView):
@@ -3218,8 +3220,6 @@ class JobTemplateCredentialsList(SubListCreateAttachDetachAPIView):
     serializer_class = CredentialSerializer
     parent_model = JobTemplate
     relationship = 'credentials'
-    new_in_330 = True
-    new_in_api_v2 = True
 
     def get_queryset(self):
         # Return the full list of credentials
@@ -3243,8 +3243,6 @@ class JobTemplateCredentialsList(SubListCreateAttachDetachAPIView):
 class JobTemplateExtraCredentialsList(JobTemplateCredentialsList):
 
     deprecated = True
-    new_in_320 = True
-    new_in_330 = False
 
     def get_queryset(self):
         sublist_qs = super(JobTemplateExtraCredentialsList, self).get_queryset()
@@ -3264,7 +3262,6 @@ class JobTemplateLabelList(DeleteLastUnattachLabelMixin, SubListCreateAttachDeta
     serializer_class = LabelSerializer
     parent_model = JobTemplate
     relationship = 'labels'
-    new_in_300 = True
 
     def post(self, request, *args, **kwargs):
         # If a label already exists in the database, attach it instead of erroring out
@@ -3453,14 +3450,12 @@ class JobTemplateInstanceGroupsList(SubListAttachDetachAPIView):
     serializer_class = InstanceGroupSerializer
     parent_model = JobTemplate
     relationship = 'instance_groups'
-    new_in_320 = True
 
 
 class JobTemplateAccessList(ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = JobTemplate
-    new_in_300 = True
 
 
 class JobTemplateObjectRolesList(SubListAPIView):
@@ -3468,7 +3463,6 @@ class JobTemplateObjectRolesList(SubListAPIView):
     model = Role
     serializer_class = RoleSerializer
     parent_model = JobTemplate
-    new_in_300 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -3476,18 +3470,22 @@ class JobTemplateObjectRolesList(SubListAPIView):
         return Role.objects.filter(content_type=content_type, object_id=po.pk)
 
 
+class JobTemplateCopy(CopyAPIView):
+
+    model = JobTemplate
+    copy_return_serializer_class = JobTemplateSerializer
+
+
 class WorkflowJobNodeList(WorkflowsEnforcementMixin, ListAPIView):
 
     model = WorkflowJobNode
     serializer_class = WorkflowJobNodeListSerializer
-    new_in_310 = True
 
 
 class WorkflowJobNodeDetail(WorkflowsEnforcementMixin, RetrieveAPIView):
 
     model = WorkflowJobNode
     serializer_class = WorkflowJobNodeDetailSerializer
-    new_in_310 = True
 
 
 class WorkflowJobNodeCredentialsList(SubListAPIView):
@@ -3496,29 +3494,23 @@ class WorkflowJobNodeCredentialsList(SubListAPIView):
     serializer_class = CredentialSerializer
     parent_model = WorkflowJobNode
     relationship = 'credentials'
-    new_in_330 = True
-    new_in_api_v2 = True
 
 
 class WorkflowJobTemplateNodeList(WorkflowsEnforcementMixin, ListCreateAPIView):
 
     model = WorkflowJobTemplateNode
     serializer_class = WorkflowJobTemplateNodeSerializer
-    new_in_310 = True
 
 
 class WorkflowJobTemplateNodeDetail(WorkflowsEnforcementMixin, RetrieveUpdateDestroyAPIView):
 
     model = WorkflowJobTemplateNode
     serializer_class = WorkflowJobTemplateNodeDetailSerializer
-    new_in_310 = True
 
 
 class WorkflowJobTemplateNodeCredentialsList(LaunchConfigCredentialsBase):
 
     parent_model = WorkflowJobTemplateNode
-    new_in_330 = True
-    new_in_api_v2 = True
 
 
 class WorkflowJobTemplateNodeChildrenBaseList(WorkflowsEnforcementMixin, EnforceParentRelationshipMixin, SubListCreateAttachDetachAPIView):
@@ -3529,7 +3521,6 @@ class WorkflowJobTemplateNodeChildrenBaseList(WorkflowsEnforcementMixin, Enforce
     parent_model = WorkflowJobTemplateNode
     relationship = ''
     enforce_parent_relationship = 'workflow_job_template'
-    new_in_310 = True
 
     '''
     Limit the set of WorkflowJobTemplateNodes to the related nodes of specified by
@@ -3599,7 +3590,6 @@ class WorkflowJobNodeChildrenBaseList(WorkflowsEnforcementMixin, SubListAPIView)
     serializer_class = WorkflowJobNodeListSerializer
     parent_model = WorkflowJobNode
     relationship = ''
-    new_in_310 = True
 
     #
     #Limit the set of WorkflowJobeNodes to the related nodes of specified by
@@ -3628,7 +3618,6 @@ class WorkflowJobTemplateList(WorkflowsEnforcementMixin, ListCreateAPIView):
     model = WorkflowJobTemplate
     serializer_class = WorkflowJobTemplateListSerializer
     always_allow_superuser = False
-    new_in_310 = True
 
 
 class WorkflowJobTemplateDetail(WorkflowsEnforcementMixin, RetrieveUpdateDestroyAPIView):
@@ -3636,14 +3625,12 @@ class WorkflowJobTemplateDetail(WorkflowsEnforcementMixin, RetrieveUpdateDestroy
     model = WorkflowJobTemplate
     serializer_class = WorkflowJobTemplateSerializer
     always_allow_superuser = False
-    new_in_310 = True
 
 
-class WorkflowJobTemplateCopy(WorkflowsEnforcementMixin, GenericAPIView):
+class WorkflowJobTemplateCopy(WorkflowsEnforcementMixin, CopyAPIView):
 
     model = WorkflowJobTemplate
-    serializer_class = EmptySerializer
-    new_in_310 = True
+    copy_return_serializer_class = WorkflowJobTemplateSerializer
 
     def get(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -3659,22 +3646,24 @@ class WorkflowJobTemplateCopy(WorkflowsEnforcementMixin, GenericAPIView):
             data.update(messages)
         return Response(data)
 
-    def post(self, request, *args, **kwargs):
-        obj = self.get_object()
-        if not request.user.can_access(self.model, 'copy', obj):
-            raise PermissionDenied()
-        new_obj = obj.user_copy(request.user)
-        if request.user not in new_obj.admin_role:
-            new_obj.admin_role.members.add(request.user)
-        data = OrderedDict()
-        data.update(WorkflowJobTemplateSerializer(
-            new_obj, context=self.get_serializer_context()).to_representation(new_obj))
-        return Response(data, status=status.HTTP_201_CREATED)
+    @staticmethod
+    def deep_copy_permission_check_func(user, new_objs):
+        for obj in new_objs:
+            for field_name in obj._get_workflow_job_field_names():
+                item = getattr(obj, field_name, None)
+                if item is None:
+                    continue
+                if field_name in ['inventory']:
+                    if not user.can_access(item.__class__, 'use', item):
+                        setattr(obj, field_name, None)
+                if field_name in ['unified_job_template']:
+                    if not user.can_access(item.__class__, 'start', item, validate_license=False):
+                        setattr(obj, field_name, None)
+            obj.save()
 
 
 class WorkflowJobTemplateLabelList(WorkflowsEnforcementMixin, JobTemplateLabelList):
     parent_model = WorkflowJobTemplate
-    new_in_310 = True
 
 
 class WorkflowJobTemplateLaunch(WorkflowsEnforcementMixin, RetrieveAPIView):
@@ -3683,7 +3672,6 @@ class WorkflowJobTemplateLaunch(WorkflowsEnforcementMixin, RetrieveAPIView):
     model = WorkflowJobTemplate
     obj_permission_type = 'start'
     serializer_class = WorkflowJobLaunchSerializer
-    new_in_310 = True
     always_allow_superuser = False
 
     def update_raw_data(self, data):
@@ -3723,7 +3711,6 @@ class WorkflowJobRelaunch(WorkflowsEnforcementMixin, GenericAPIView):
     model = WorkflowJob
     obj_permission_type = 'start'
     serializer_class = EmptySerializer
-    new_in_310 = True
 
     def check_object_permissions(self, request, obj):
         if request.method == 'POST' and obj:
@@ -3752,7 +3739,6 @@ class WorkflowJobTemplateWorkflowNodesList(WorkflowsEnforcementMixin, SubListCre
     parent_model = WorkflowJobTemplate
     relationship = 'workflow_job_template_nodes'
     parent_key = 'workflow_job_template'
-    new_in_310 = True
 
     def get_queryset(self):
         return super(WorkflowJobTemplateWorkflowNodesList, self).get_queryset().order_by('id')
@@ -3765,7 +3751,6 @@ class WorkflowJobTemplateJobsList(WorkflowsEnforcementMixin, SubListAPIView):
     parent_model = WorkflowJobTemplate
     relationship = 'workflow_jobs'
     parent_key = 'workflow_job_template'
-    new_in_310 = True
 
 
 class WorkflowJobTemplateSchedulesList(WorkflowsEnforcementMixin, SubListCreateAPIView):
@@ -3777,7 +3762,6 @@ class WorkflowJobTemplateSchedulesList(WorkflowsEnforcementMixin, SubListCreateA
     parent_model = WorkflowJobTemplate
     relationship = 'schedules'
     parent_key = 'unified_job_template'
-    new_in_310 = True
 
 
 class WorkflowJobTemplateNotificationTemplatesAnyList(WorkflowsEnforcementMixin, SubListCreateAttachDetachAPIView):
@@ -3786,7 +3770,6 @@ class WorkflowJobTemplateNotificationTemplatesAnyList(WorkflowsEnforcementMixin,
     serializer_class = NotificationTemplateSerializer
     parent_model = WorkflowJobTemplate
     relationship = 'notification_templates_any'
-    new_in_310 = True
 
 
 class WorkflowJobTemplateNotificationTemplatesErrorList(WorkflowsEnforcementMixin, SubListCreateAttachDetachAPIView):
@@ -3795,7 +3778,6 @@ class WorkflowJobTemplateNotificationTemplatesErrorList(WorkflowsEnforcementMixi
     serializer_class = NotificationTemplateSerializer
     parent_model = WorkflowJobTemplate
     relationship = 'notification_templates_error'
-    new_in_310 = True
 
 
 class WorkflowJobTemplateNotificationTemplatesSuccessList(WorkflowsEnforcementMixin, SubListCreateAttachDetachAPIView):
@@ -3804,14 +3786,12 @@ class WorkflowJobTemplateNotificationTemplatesSuccessList(WorkflowsEnforcementMi
     serializer_class = NotificationTemplateSerializer
     parent_model = WorkflowJobTemplate
     relationship = 'notification_templates_success'
-    new_in_310 = True
 
 
 class WorkflowJobTemplateAccessList(WorkflowsEnforcementMixin, ResourceAccessList):
 
     model = User # needs to be User for AccessLists's
     parent_model = WorkflowJobTemplate
-    new_in_310 = True
 
 
 class WorkflowJobTemplateObjectRolesList(WorkflowsEnforcementMixin, SubListAPIView):
@@ -3819,7 +3799,6 @@ class WorkflowJobTemplateObjectRolesList(WorkflowsEnforcementMixin, SubListAPIVi
     model = Role
     serializer_class = RoleSerializer
     parent_model = WorkflowJobTemplate
-    new_in_310 = True
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -3833,7 +3812,6 @@ class WorkflowJobTemplateActivityStreamList(WorkflowsEnforcementMixin, ActivityS
     serializer_class = ActivityStreamSerializer
     parent_model = WorkflowJobTemplate
     relationship = 'activitystream_set'
-    new_in_310 = True
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -3847,14 +3825,12 @@ class WorkflowJobList(WorkflowsEnforcementMixin, ListCreateAPIView):
 
     model = WorkflowJob
     serializer_class = WorkflowJobListSerializer
-    new_in_310 = True
 
 
 class WorkflowJobDetail(WorkflowsEnforcementMixin, UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
 
     model = WorkflowJob
     serializer_class = WorkflowJobSerializer
-    new_in_310 = True
 
 
 class WorkflowJobWorkflowNodesList(WorkflowsEnforcementMixin, SubListAPIView):
@@ -3865,7 +3841,6 @@ class WorkflowJobWorkflowNodesList(WorkflowsEnforcementMixin, SubListAPIView):
     parent_model = WorkflowJob
     relationship = 'workflow_job_nodes'
     parent_key = 'workflow_job'
-    new_in_310 = True
 
     def get_queryset(self):
         return super(WorkflowJobWorkflowNodesList, self).get_queryset().order_by('id')
@@ -3876,7 +3851,6 @@ class WorkflowJobCancel(WorkflowsEnforcementMixin, RetrieveAPIView):
     model = WorkflowJob
     obj_permission_type = 'cancel'
     serializer_class = WorkflowJobCancelSerializer
-    new_in_310 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -3895,7 +3869,6 @@ class WorkflowJobNotificationsList(WorkflowsEnforcementMixin, SubListAPIView):
     serializer_class = NotificationSerializer
     parent_model = WorkflowJob
     relationship = 'notifications'
-    new_in_310 = True
 
 
 class WorkflowJobActivityStreamList(WorkflowsEnforcementMixin, ActivityStreamEnforcementMixin, SubListAPIView):
@@ -3904,14 +3877,12 @@ class WorkflowJobActivityStreamList(WorkflowsEnforcementMixin, ActivityStreamEnf
     serializer_class = ActivityStreamSerializer
     parent_model = WorkflowJob
     relationship = 'activitystream_set'
-    new_in_310 = True
 
 
 class SystemJobTemplateList(ListAPIView):
 
     model = SystemJobTemplate
     serializer_class = SystemJobTemplateSerializer
-    new_in_210 = True
 
     def get(self, request, *args, **kwargs):
         if not request.user.is_superuser and not request.user.is_system_auditor:
@@ -3923,7 +3894,6 @@ class SystemJobTemplateDetail(RetrieveAPIView):
 
     model = SystemJobTemplate
     serializer_class = SystemJobTemplateSerializer
-    new_in_210 = True
 
 
 class SystemJobTemplateLaunch(GenericAPIView):
@@ -3931,7 +3901,6 @@ class SystemJobTemplateLaunch(GenericAPIView):
     model = SystemJobTemplate
     obj_permission_type = 'start'
     serializer_class = EmptySerializer
-    new_in_210 = True
 
     def get(self, request, *args, **kwargs):
         return Response({})
@@ -3956,7 +3925,6 @@ class SystemJobTemplateSchedulesList(SubListCreateAPIView):
     parent_model = SystemJobTemplate
     relationship = 'schedules'
     parent_key = 'unified_job_template'
-    new_in_210 = True
 
 
 class SystemJobTemplateJobsList(SubListAPIView):
@@ -3966,7 +3934,6 @@ class SystemJobTemplateJobsList(SubListAPIView):
     parent_model = SystemJobTemplate
     relationship = 'jobs'
     parent_key = 'system_job_template'
-    new_in_210 = True
 
 
 class SystemJobTemplateNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView):
@@ -3975,7 +3942,6 @@ class SystemJobTemplateNotificationTemplatesAnyList(SubListCreateAttachDetachAPI
     serializer_class = NotificationTemplateSerializer
     parent_model = SystemJobTemplate
     relationship = 'notification_templates_any'
-    new_in_300 = True
 
 
 class SystemJobTemplateNotificationTemplatesErrorList(SubListCreateAttachDetachAPIView):
@@ -3984,7 +3950,6 @@ class SystemJobTemplateNotificationTemplatesErrorList(SubListCreateAttachDetachA
     serializer_class = NotificationTemplateSerializer
     parent_model = SystemJobTemplate
     relationship = 'notification_templates_error'
-    new_in_300 = True
 
 
 class SystemJobTemplateNotificationTemplatesSuccessList(SubListCreateAttachDetachAPIView):
@@ -3993,7 +3958,6 @@ class SystemJobTemplateNotificationTemplatesSuccessList(SubListCreateAttachDetac
     serializer_class = NotificationTemplateSerializer
     parent_model = SystemJobTemplate
     relationship = 'notification_templates_success'
-    new_in_300 = True
 
 
 class JobList(ListCreateAPIView):
@@ -4037,15 +4001,11 @@ class JobCredentialsList(SubListAPIView):
     serializer_class = CredentialSerializer
     parent_model = Job
     relationship = 'credentials'
-    new_in_api_v2 = True
-    new_in_330 = True
 
 
 class JobExtraCredentialsList(JobCredentialsList):
 
     deprecated = True
-    new_in_320 = True
-    new_in_330 = False
 
     def get_queryset(self):
         sublist_qs = super(JobExtraCredentialsList, self).get_queryset()
@@ -4060,12 +4020,10 @@ class JobLabelList(SubListAPIView):
     parent_model = Job
     relationship = 'labels'
     parent_key = 'job'
-    new_in_300 = True
 
 
 class WorkflowJobLabelList(WorkflowsEnforcementMixin, JobLabelList):
     parent_model = WorkflowJob
-    new_in_310 = True
 
 
 class JobActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -4074,7 +4032,6 @@ class JobActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
     serializer_class = ActivityStreamSerializer
     parent_model = Job
     relationship = 'activitystream_set'
-    new_in_145 = True
 
 
 # TODO: remove endpoint in 3.3
@@ -4195,18 +4152,23 @@ class JobCreateSchedule(RetrieveAPIView):
     model = Job
     obj_permission_type = 'start'
     serializer_class = JobCreateScheduleSerializer
-    new_in_330 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
 
         if not obj.can_schedule:
-            return Response({"error": _('Information needed to schedule this job is missing.')},
+            if getattr(obj, 'passwords_needed_to_start', None):
+                return Response({"error": _('Cannot create schedule because job requires credential passwords.')},
+                                status=status.HTTP_400_BAD_REQUEST)
+            try:
+                obj.launch_config
+            except ObjectDoesNotExist:
+                return Response({"error": _('Cannot create schedule because job was launched by legacy method.')},
+                                status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": _('Cannot create schedule because a related resource is missing.')},
                             status=status.HTTP_400_BAD_REQUEST)
 
         config = obj.launch_config
-        if not request.user.can_access(JobLaunchConfig, 'add', {'reference_obj': obj}):
-            raise PermissionDenied()
 
         # Make up a name for the schedule, guarentee that it is unique
         name = 'Auto-generated schedule from job {}'.format(obj.id)
@@ -4219,7 +4181,7 @@ class JobCreateSchedule(RetrieveAPIView):
                 alt_name = '{} - number {}'.format(name, idx)
             name = alt_name
 
-        schedule = Schedule.objects.create(
+        schedule_data = dict(
             name=name,
             unified_job_template=obj.unified_job_template,
             enabled=False,
@@ -4227,11 +4189,18 @@ class JobCreateSchedule(RetrieveAPIView):
             extra_data=config.extra_data,
             survey_passwords=config.survey_passwords,
             inventory=config.inventory,
-            char_prompts=config.char_prompts
+            char_prompts=config.char_prompts,
+            credentials=set(config.credentials.all())
         )
-        schedule.credentials.add(*config.credentials.all())
+        if not request.user.can_access(Schedule, 'add', schedule_data):
+            raise PermissionDenied()
+
+        creds_list = schedule_data.pop('credentials')
+        schedule = Schedule.objects.create(**schedule_data)
+        schedule.credentials.add(*creds_list)
 
         data = ScheduleSerializer(schedule, context=self.get_serializer_context()).data
+        data.serializer.instance = None  # hack to avoid permissions.py assuming this is Job model
         headers = {'Location': schedule.get_absolute_url(request=request)}
         return Response(data, status=status.HTTP_201_CREATED, headers=headers)
 
@@ -4242,7 +4211,6 @@ class JobNotificationsList(SubListAPIView):
     serializer_class = NotificationSerializer
     parent_model = Job
     relationship = 'notifications'
-    new_in_300 = True
 
 
 class BaseJobHostSummariesList(SubListAPIView):
@@ -4359,7 +4327,6 @@ class AdHocCommandList(ListCreateAPIView):
 
     model = AdHocCommand
     serializer_class = AdHocCommandListSerializer
-    new_in_220 = True
     always_allow_superuser = False
 
     @csrf_exempt
@@ -4434,7 +4401,6 @@ class AdHocCommandDetail(UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
 
     model = AdHocCommand
     serializer_class = AdHocCommandSerializer
-    new_in_220 = True
 
 
 class AdHocCommandCancel(RetrieveAPIView):
@@ -4442,7 +4408,6 @@ class AdHocCommandCancel(RetrieveAPIView):
     model = AdHocCommand
     obj_permission_type = 'cancel'
     serializer_class = AdHocCommandCancelSerializer
-    new_in_220 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -4458,7 +4423,6 @@ class AdHocCommandRelaunch(GenericAPIView):
     model = AdHocCommand
     obj_permission_type = 'start'
     serializer_class = AdHocCommandRelaunchSerializer
-    new_in_220 = True
 
     # FIXME: Figure out why OPTIONS request still shows all fields.
 
@@ -4515,14 +4479,12 @@ class AdHocCommandEventList(ListAPIView):
 
     model = AdHocCommandEvent
     serializer_class = AdHocCommandEventSerializer
-    new_in_220 = True
 
 
 class AdHocCommandEventDetail(RetrieveAPIView):
 
     model = AdHocCommandEvent
     serializer_class = AdHocCommandEventSerializer
-    new_in_220 = True
 
 
 class BaseAdHocCommandEventsList(SubListAPIView):
@@ -4532,13 +4494,11 @@ class BaseAdHocCommandEventsList(SubListAPIView):
     parent_model = None # Subclasses must define this attribute.
     relationship = 'ad_hoc_command_events'
     view_name = _('Ad Hoc Command Events List')
-    new_in_220 = True
 
 
 class HostAdHocCommandEventsList(BaseAdHocCommandEventsList):
 
     parent_model = Host
-    new_in_220 = True
 
 
 #class GroupJobEventsList(BaseJobEventsList):
@@ -4548,7 +4508,6 @@ class HostAdHocCommandEventsList(BaseAdHocCommandEventsList):
 class AdHocCommandAdHocCommandEventsList(BaseAdHocCommandEventsList):
 
     parent_model = AdHocCommand
-    new_in_220 = True
 
 
 class AdHocCommandActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -4557,7 +4516,6 @@ class AdHocCommandActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIV
     serializer_class = ActivityStreamSerializer
     parent_model = AdHocCommand
     relationship = 'activitystream_set'
-    new_in_220 = True
 
 
 class AdHocCommandNotificationsList(SubListAPIView):
@@ -4566,14 +4524,12 @@ class AdHocCommandNotificationsList(SubListAPIView):
     serializer_class = NotificationSerializer
     parent_model = AdHocCommand
     relationship = 'notifications'
-    new_in_300 = True
 
 
 class SystemJobList(ListCreateAPIView):
 
     model = SystemJob
     serializer_class = SystemJobListSerializer
-    new_in_210 = True
 
     def get(self, request, *args, **kwargs):
         if not request.user.is_superuser and not request.user.is_system_auditor:
@@ -4585,7 +4541,6 @@ class SystemJobDetail(UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
 
     model = SystemJob
     serializer_class = SystemJobSerializer
-    new_in_210 = True
 
 
 class SystemJobCancel(RetrieveAPIView):
@@ -4593,7 +4548,6 @@ class SystemJobCancel(RetrieveAPIView):
     model = SystemJob
     obj_permission_type = 'cancel'
     serializer_class = SystemJobCancelSerializer
-    new_in_210 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -4610,18 +4564,16 @@ class SystemJobNotificationsList(SubListAPIView):
     serializer_class = NotificationSerializer
     parent_model = SystemJob
     relationship = 'notifications'
-    new_in_300 = True
 
 
 class UnifiedJobTemplateList(ListAPIView):
 
     model = UnifiedJobTemplate
     serializer_class = UnifiedJobTemplateSerializer
-    new_in_148 = True
     capabilities_prefetch = [
         'admin', 'execute',
         {'copy': ['jobtemplate.project.use', 'jobtemplate.inventory.use',
-                  'workflowjobtemplate.organization.admin']}
+                  'workflowjobtemplate.organization.workflow_admin']}
     ]
 
 
@@ -4629,7 +4581,6 @@ class UnifiedJobList(ListAPIView):
 
     model = UnifiedJob
     serializer_class = UnifiedJobListSerializer
-    new_in_148 = True
 
 
 class StdoutANSIFilter(object):
@@ -4661,13 +4612,12 @@ class StdoutANSIFilter(object):
 
 class UnifiedJobStdout(RetrieveAPIView):
 
-    authentication_classes = [TokenGetAuthentication] + api_settings.DEFAULT_AUTHENTICATION_CLASSES
+    authentication_classes = api_settings.DEFAULT_AUTHENTICATION_CLASSES
     serializer_class = UnifiedJobStdoutSerializer
     renderer_classes = [BrowsableAPIRenderer, renderers.StaticHTMLRenderer,
                         PlainTextRenderer, AnsiTextRenderer,
                         renderers.JSONRenderer, DownloadTextRenderer, AnsiDownloadRenderer]
     filter_backends = ()
-    new_in_148 = True
 
     def retrieve(self, request, *args, **kwargs):
         unified_job = self.get_object()
@@ -4738,7 +4688,6 @@ class UnifiedJobStdout(RetrieveAPIView):
 class ProjectUpdateStdout(UnifiedJobStdout):
 
     model = ProjectUpdate
-    new_in_13 = True
 
 
 class InventoryUpdateStdout(UnifiedJobStdout):
@@ -4754,21 +4703,18 @@ class JobStdout(UnifiedJobStdout):
 class AdHocCommandStdout(UnifiedJobStdout):
 
     model = AdHocCommand
-    new_in_220 = True
 
 
 class NotificationTemplateList(ListCreateAPIView):
 
     model = NotificationTemplate
     serializer_class = NotificationTemplateSerializer
-    new_in_300 = True
 
 
 class NotificationTemplateDetail(RetrieveUpdateDestroyAPIView):
 
     model = NotificationTemplate
     serializer_class = NotificationTemplateSerializer
-    new_in_300 = True
 
     def delete(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -4787,7 +4733,6 @@ class NotificationTemplateTest(GenericAPIView):
     model = NotificationTemplate
     obj_permission_type = 'start'
     serializer_class = EmptySerializer
-    new_in_300 = True
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -4813,49 +4758,48 @@ class NotificationTemplateNotificationList(SubListAPIView):
     parent_model = NotificationTemplate
     relationship = 'notifications'
     parent_key = 'notification_template'
-    new_in_300 = True
+
+
+class NotificationTemplateCopy(CopyAPIView):
+
+    model = NotificationTemplate
+    copy_return_serializer_class = NotificationTemplateSerializer
 
 
 class NotificationList(ListAPIView):
 
     model = Notification
     serializer_class = NotificationSerializer
-    new_in_300 = True
 
 
 class NotificationDetail(RetrieveAPIView):
 
     model = Notification
     serializer_class = NotificationSerializer
-    new_in_300 = True
 
 
 class LabelList(ListCreateAPIView):
 
     model = Label
     serializer_class = LabelSerializer
-    new_in_300 = True
 
 
 class LabelDetail(RetrieveUpdateAPIView):
 
     model = Label
     serializer_class = LabelSerializer
-    new_in_300 = True
 
 
 class ActivityStreamList(ActivityStreamEnforcementMixin, SimpleListAPIView):
 
     model = ActivityStream
     serializer_class = ActivityStreamSerializer
-    new_in_145 = True
 
 
 class ActivityStreamDetail(ActivityStreamEnforcementMixin, RetrieveAPIView):
 
     model = ActivityStream
     serializer_class = ActivityStreamSerializer
-    new_in_145 = True
 
 
 class RoleList(ListAPIView):
@@ -4863,7 +4807,6 @@ class RoleList(ListAPIView):
     model = Role
     serializer_class = RoleSerializer
     permission_classes = (IsAuthenticated,)
-    new_in_300 = True
 
     def get_queryset(self):
         result = Role.visible_roles(self.request.user)
@@ -4882,7 +4825,6 @@ class RoleDetail(RetrieveAPIView):
 
     model = Role
     serializer_class = RoleSerializer
-    new_in_300 = True
 
 
 class RoleUsersList(SubListAttachDetachAPIView):
@@ -4891,7 +4833,6 @@ class RoleUsersList(SubListAttachDetachAPIView):
     serializer_class = UserSerializer
     parent_model = Role
     relationship = 'members'
-    new_in_300 = True
 
     def get_queryset(self):
         role = self.get_parent_object()
@@ -4933,7 +4874,6 @@ class RoleTeamsList(SubListAttachDetachAPIView):
     parent_model = Role
     relationship = 'member_role.parents'
     permission_classes = (IsAuthenticated,)
-    new_in_300 = True
 
     def get_queryset(self):
         role = self.get_parent_object()
@@ -4985,7 +4925,6 @@ class RoleParentsList(SubListAPIView):
     parent_model = Role
     relationship = 'parents'
     permission_classes = (IsAuthenticated,)
-    new_in_300 = True
 
     def get_queryset(self):
         role = Role.objects.get(pk=self.kwargs['pk'])
@@ -4999,7 +4938,6 @@ class RoleChildrenList(SubListAPIView):
     parent_model = Role
     relationship = 'children'
     permission_classes = (IsAuthenticated,)
-    new_in_300 = True
 
     def get_queryset(self):
         role = Role.objects.get(pk=self.kwargs['pk'])

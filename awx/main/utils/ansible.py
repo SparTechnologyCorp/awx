@@ -13,7 +13,7 @@ from django.utils.encoding import smart_str
 __all__ = ['skip_directory', 'could_be_playbook', 'could_be_inventory']
 
 
-valid_playbook_re = re.compile(r'^\s*?-?\s*?(?:hosts|include):\s*?.*?$')
+valid_playbook_re = re.compile(r'^\s*?-?\s*?(?:hosts|include|import_playbook):\s*?.*?$')
 valid_inventory_re = re.compile(r'^[a-zA-Z0-9_.=\[\]]')
 
 
@@ -44,7 +44,7 @@ def could_be_playbook(project_path, dir_path, filename):
     # show up.
     matched = False
     try:
-        for n, line in enumerate(file(playbook_path)):
+        for n, line in enumerate(open(playbook_path)):
             if valid_playbook_re.match(line):
                 matched = True
             # Any YAML file can also be encrypted with vault;

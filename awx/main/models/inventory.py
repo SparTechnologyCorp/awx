@@ -9,6 +9,7 @@ import copy
 from urlparse import urljoin
 import os.path
 import six
+from distutils.version import LooseVersion
 
 # Django
 from django.conf import settings
@@ -37,7 +38,8 @@ from awx.main.models.notifications import (
     NotificationTemplate,
     JobNotificationMixin,
 )
-from awx.main.utils import _inventory_updates
+from awx.main.utils import _inventory_updates, get_ansible_version
+
 
 __all__ = ['Inventory', 'Host', 'Group', 'InventorySource', 'InventoryUpdate',
            'CustomInventoryScript', 'SmartInventoryMembership']
@@ -50,6 +52,7 @@ class Inventory(CommonModelNameNotUnique, ResourceMixin):
     an inventory source contains lists and hosts.
     '''
 
+    FIELDS_TO_PRESERVE_AT_COPY = ['hosts', 'groups', 'instance_groups']
     KIND_CHOICES = [
         ('', _('Hosts have a direct link to this inventory.')),
         ('smart', _('Hosts for inventory generated using the host_filter property.')),
@@ -131,7 +134,7 @@ class Inventory(CommonModelNameNotUnique, ResourceMixin):
         blank=True,
     )
     admin_role = ImplicitRoleField(
-        parent_role='organization.admin_role',
+        parent_role='organization.inventory_admin_role',
     )
     update_role = ImplicitRoleField(
         parent_role='admin_role',
@@ -505,6 +508,10 @@ class Host(CommonModelNameNotUnique):
     A managed node
     '''
 
+    FIELDS_TO_PRESERVE_AT_COPY = [
+        'name', 'description', 'groups', 'inventory', 'enabled', 'instance_id', 'variables'
+    ]
+
     class Meta:
         app_label = 'main'
         unique_together = (("name", "inventory"),) # FIXME: Add ('instance_id', 'inventory') after migration.
@@ -691,6 +698,10 @@ class Group(CommonModelNameNotUnique):
     A group containing managed hosts.  A group or host may belong to multiple
     groups.
     '''
+
+    FIELDS_TO_PRESERVE_AT_COPY = [
+        'name', 'description', 'inventory', 'children', 'parents', 'hosts', 'variables'
+    ]
 
     class Meta:
         app_label = 'main'
@@ -1075,14 +1086,6 @@ class InventorySourceOptions(BaseModel):
         default='',
         help_text=_('Inventory source variables in YAML or JSON format.'),
     )
-    credential = models.ForeignKey(
-        'Credential',
-        related_name='%(class)ss',
-        null=True,
-        default=None,
-        blank=True,
-        on_delete=models.SET_NULL,
-    )
     source_regions = models.CharField(
         max_length=1024,
         blank=True,
@@ -1214,30 +1217,48 @@ class InventorySourceOptions(BaseModel):
         """No region supprt"""
         return [('all', 'All')]
 
-    def clean_credential(self):
-        if not self.source:
+    @staticmethod
+    def cloud_credential_validation(source, cred):
+        if not source:
             return None
-        cred = self.credential
-        if cred and self.source not in ('custom', 'scm'):
+        if cred and source not in ('custom', 'scm'):
             # If a credential was provided, it's important that it matches
             # the actual inventory source being used (Amazon requires Amazon
             # credentials; Rackspace requires Rackspace credentials; etc...)
-            if self.source.replace('ec2', 'aws') != cred.kind:
-                raise ValidationError(
-                    _('Cloud-based inventory sources (such as %s) require '
-                      'credentials for the matching cloud service.') % self.source
-                )
+            if source.replace('ec2', 'aws') != cred.kind:
+                return _('Cloud-based inventory sources (such as %s) require '
+                         'credentials for the matching cloud service.') % source
         # Allow an EC2 source to omit the credential.  If Tower is running on
         # an EC2 instance with an IAM Role assigned, boto will use credentials
         # from the instance metadata instead of those explicitly provided.
-        elif self.source in CLOUD_PROVIDERS and self.source != 'ec2':
-            raise ValidationError(_('Credential is required for a cloud source.'))
-        elif self.source == 'custom' and cred and cred.credential_type.kind in ('scm', 'ssh', 'insights', 'vault'):
-            raise ValidationError(_(
+        elif source in CLOUD_PROVIDERS and source != 'ec2':
+            return _('Credential is required for a cloud source.')
+        elif source == 'custom' and cred and cred.credential_type.kind in ('scm', 'ssh', 'insights', 'vault'):
+            return _(
                 'Credentials of type machine, source control, insights and vault are '
                 'disallowed for custom inventory sources.'
-            ))
-        return cred
+            )
+        return None
+
+    def get_deprecated_credential(self, kind):
+        for cred in self.credentials.all():
+            if cred.credential_type.kind == kind:
+                return cred
+        else:
+            return None
+
+    def get_cloud_credential(self):
+        credential = None
+        for cred in self.credentials.all():
+            if cred.credential_type.kind != 'vault':
+                credential = cred
+        return credential
+
+    @property
+    def credential(self):
+        cred = self.get_cloud_credential()
+        if cred is not None:
+            return cred.pk
 
     def clean_source_regions(self):
         regions = self.source_regions
@@ -1265,7 +1286,7 @@ class InventorySourceOptions(BaseModel):
     source_vars_dict = VarsDictProperty('source_vars')
 
     def clean_instance_filters(self):
-        instance_filters = unicode(self.instance_filters or '')
+        instance_filters = six.text_type(self.instance_filters or '')
         if self.source == 'ec2':
             invalid_filters = []
             instance_filter_re = re.compile(r'^((tag:.+)|([a-z][a-z\.-]*[a-z]))=.*$')
@@ -1291,7 +1312,7 @@ class InventorySourceOptions(BaseModel):
             return ''
 
     def clean_group_by(self):
-        group_by = unicode(self.group_by or '')
+        group_by = six.text_type(self.group_by or '')
         if self.source == 'ec2':
             get_choices = getattr(self, 'get_%s_group_by_choices' % self.source)
             valid_choices = [x[0] for x in get_choices()]
@@ -1367,7 +1388,7 @@ class InventorySource(UnifiedJobTemplate, InventorySourceOptions):
     @classmethod
     def _get_unified_job_field_names(cls):
         return set(f.name for f in InventorySourceOptions._meta.fields) | set(
-            ['name', 'description', 'schedule']
+            ['name', 'description', 'schedule', 'credentials']
         )
 
     def save(self, *args, **kwargs):
@@ -1520,9 +1541,10 @@ class InventorySource(UnifiedJobTemplate, InventorySourceOptions):
                                     "Instead, configure the corresponding source project to update on launch."))
         return self.update_on_launch
 
-    def clean_overwrite_vars(self):
+    def clean_overwrite_vars(self):  # TODO: remove when Ansible 2.4 becomes unsupported, obviously
         if self.source == 'scm' and not self.overwrite_vars:
-            raise ValidationError(_("SCM type sources must set `overwrite_vars` to `true`."))
+            if get_ansible_version() < LooseVersion('2.5'):
+                raise ValidationError(_("SCM type sources must set `overwrite_vars` to `true` until Ansible 2.5."))
         return self.overwrite_vars
 
     def clean_source_path(self):
@@ -1612,7 +1634,7 @@ class InventoryUpdate(UnifiedJob, InventorySourceOptions, JobNotificationMixin, 
             return False
 
         if (self.source not in ('custom', 'ec2', 'scm') and
-                not (self.credential)):
+                not (self.get_cloud_credential())):
             return False
         elif self.source == 'scm' and not self.inventory_source.source_project:
             return False

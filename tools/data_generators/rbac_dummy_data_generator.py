@@ -89,7 +89,7 @@ options = vars(options)
 
 
 if options['preset']:
-    print ' Using preset data numbers set ' + str(options['preset'])
+    print(' Using preset data numbers set ' + str(options['preset']))
     # Read the numbers of resources from presets file, if provided
     presets_filename = os.path.abspath(os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'presets.tsv'))
@@ -554,12 +554,12 @@ def make_the_data():
                     if i % 2 == 0:
                         # only apply inventories for every other node
                         kwargs['inventory'] = next(inv_gen)
-                    if i % 3 == 0:
-                        # only apply prompted credential every 3rd node
-                        kwargs['credential'] = next(cred_gen)
                     node, _ = WorkflowJobTemplateNode.objects.get_or_create(
                         **kwargs
                     )
+                    if i % 3 == 0:
+                        # only apply prompted credential every 3rd node
+                        node.credentials.add(next(cred_gen))
                     # nodes.append(node)
                     wfjt_nodes.append(node)
                     if i <= 3:

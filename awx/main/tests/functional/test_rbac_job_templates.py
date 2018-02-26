@@ -80,10 +80,15 @@ def test_job_template_access_use_level(jt_linked, rando):
 
 
 @pytest.mark.django_db
-def test_job_template_access_org_admin(jt_linked, rando):
+@pytest.mark.parametrize("role_names", [("admin_role",), ("inventory_admin_role", "project_admin_role")])
+def test_job_template_access_admin(role_names, jt_linked, rando):
     access = JobTemplateAccess(rando)
     # Appoint this user as admin of the organization
-    jt_linked.inventory.organization.admin_role.members.add(rando)
+    #jt_linked.inventory.organization.admin_role.members.add(rando)
+    for role_name in role_names:
+        role = getattr(jt_linked.inventory.organization, role_name)
+        role.members.add(rando)
+
     # Assign organization permission in the same way the create view does
     organization = jt_linked.inventory.organization
     jt_linked.get_deprecated_credential('ssh').admin_role.parents.add(organization.admin_role)
@@ -270,3 +275,24 @@ class TestJobTemplateSchedules:
         schedule = Schedule.objects.create(unified_job_template=job_template, rrule=self.rrule, created_by=rando)
         access = ScheduleAccess(rando)
         assert access.can_change(schedule, {'rrule': self.rrule2})
+
+    def test_prompts_access_checked(self, job_template, inventory, credential, rando):
+        job_template.execute_role.members.add(rando)
+        access = ScheduleAccess(rando)
+        data = dict(
+            unified_job_template=job_template,
+            rrule=self.rrule,
+            created_by=rando,
+            inventory=inventory,
+            credentials=[credential]
+        )
+        with mock.patch('awx.main.access.JobLaunchConfigAccess.can_add') as mock_add:
+            mock_add.return_value = True
+            assert access.can_add(data)
+            mock_add.assert_called_once_with(data)
+        data.pop('credentials')
+        schedule = Schedule.objects.create(**data)
+        with mock.patch('awx.main.access.JobLaunchConfigAccess.can_change') as mock_change:
+            mock_change.return_value = True
+            assert access.can_change(schedule, {'inventory': 42})
+            mock_change.assert_called_once_with(schedule, {'inventory': 42})

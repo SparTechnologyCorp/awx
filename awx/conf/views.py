@@ -21,7 +21,7 @@ from awx.api.generics import *  # noqa
 from awx.api.permissions import IsSuperUser
 from awx.api.versioning import reverse, get_request_version
 from awx.main.utils import *  # noqa
-from awx.main.utils.handlers import BaseHTTPSHandler, LoggingConnectivityException
+from awx.main.utils.handlers import BaseHTTPSHandler, UDPHandler, LoggingConnectivityException
 from awx.main.tasks import handle_setting_changes
 from awx.conf.license import get_licensed_features
 from awx.conf.models import Setting
@@ -44,7 +44,6 @@ class SettingCategoryList(ListAPIView):
     model = Setting  # Not exactly, but needed for the view.
     serializer_class = SettingCategorySerializer
     filter_backends = []
-    new_in_310 = True
     view_name = _('Setting Categories')
 
     def get_queryset(self):
@@ -69,7 +68,6 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
     model = Setting  # Not exactly, but needed for the view.
     serializer_class = SettingSingletonSerializer
     filter_backends = []
-    new_in_310 = True
     view_name = _('Setting Detail')
 
     def get_queryset(self):
@@ -170,7 +168,6 @@ class SettingLoggingTest(GenericAPIView):
     serializer_class = SettingSingletonSerializer
     permission_classes = (IsSuperUser,)
     filter_backends = []
-    new_in_320 = True
 
     def post(self, request, *args, **kwargs):
         defaults = dict()
@@ -202,7 +199,11 @@ class SettingLoggingTest(GenericAPIView):
             for k, v in serializer.validated_data.items():
                 setattr(mock_settings, k, v)
             mock_settings.LOG_AGGREGATOR_LEVEL = 'DEBUG'
-            BaseHTTPSHandler.perform_test(mock_settings)
+            if mock_settings.LOG_AGGREGATOR_PROTOCOL.upper() == 'UDP':
+                UDPHandler.perform_test(mock_settings)
+                return Response(status=status.HTTP_201_CREATED)
+            else:
+                BaseHTTPSHandler.perform_test(mock_settings)
         except LoggingConnectivityException as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         return Response(status=status.HTTP_200_OK)

@@ -578,7 +578,7 @@
             </p>
         </div>
         <div class="SchedulerFormDetail-container"
-            ng-show="schedulerIsValid">
+            ng-show="schedulerIsValid &&  !preview_list.isEmpty">
             <label class="SchedulerFormDetail-label">
                 Schedule Description
             </label>
@@ -623,15 +623,15 @@
             <ul class="occurrence-list mono-space
                 SchedulerFormDetail-occurrenceList"
                 ng-show="dateChoice == 'utc'">
-                <li ng-repeat="occurrence in occurrence_list">
-                    {{ occurrence.utc }}
+                <li ng-repeat="occurrence in preview_list.utc">
+                    {{ occurrence }} UTC
                 </li>
             </ul>
             <ul class="occurrence-list mono-space
                 SchedulerFormDetail-occurrenceList"
                 ng-show="dateChoice == 'local'">
-                <li ng-repeat="occurrence in occurrence_list">
-                    {{ occurrence.local }}
+                <li ng-repeat="occurrence in preview_list.local">
+                    {{ occurrence }}
                 </li>
             </ul>
 
@@ -661,23 +661,30 @@
             </div>
         </div>
     </div>
-            <div class="buttons Form-buttons">
-                <button type="button"
-                    class="btn btn-sm Form-cancelButton"
-                    id="project_cancel_btn"
-                    ng-show="!(schedule_obj.summary_fields.user_capabilities.edit || canAdd)"
-                    ng-click="formCancel()">Close</button>
-                <button type="button"
-                    class="btn btn-sm Form-cancelButton"
-                    id="project_cancel_btn"
-                    ng-show="(schedule_obj.summary_fields.user_capabilities.edit || canAdd)"
-                    ng-click="formCancel()">Cancel</button>
-                <button type="button"
-                    class="btn btn-sm Form-saveButton"
-                    id="project_save_btn"
-                    ng-click="saveSchedule()"
-                    ng-show="(schedule_obj.summary_fields.user_capabilities.edit || canAdd)"
-                    ng-disabled="!schedulerIsValid"> Save</button>
-
-            </div>
+    <div class="buttons Form-buttons">
+        <button type="button"
+            class="btn btn-sm Form-primaryButton Form-primaryButton--noMargin"
+            id="schedule_prompt_btn"
+            ng-show="(schedule_obj.summary_fields.user_capabilities.edit || canAdd) && showPromptButton"
+            ng-click="prompt()">Prompt</button>
+        <button type="button"
+            class="btn btn-sm Form-cancelButton"
+            id="schedule_cancel_btn"
+            ng-show="!(schedule_obj.summary_fields.user_capabilities.edit || canAdd)"
+            ng-click="formCancel()">Close</button>
+        <button type="button"
+            class="btn btn-sm Form-cancelButton"
+            id="schedule_cancel_btn"
+            ng-show="(schedule_obj.summary_fields.user_capabilities.edit || canAdd)"
+            ng-click="formCancel()">Cancel</button>
+        <div class="SchedulerForm-promptSave" ng-show="(schedule_obj.summary_fields.user_capabilities.edit || canAdd)">
+            <div ng-if="promptModalMissingReqFields" class="SchedulerForm-promptSaveTooltip" aw-tool-tip="Additional information required in the Prompt area before saving" data-placement="top"></div>
+            <button type="button"
+                class="btn btn-sm Form-saveButton"
+                id="schedule_save_btn"
+                ng-click="saveSchedule()"
+                ng-disabled="!schedulerIsValid || promptModalMissingReqFields"> Save</button>
+        </div>
     </div>
+    <prompt prompt-data="promptData" action-text="CONFIRM"></launch>
+</div>

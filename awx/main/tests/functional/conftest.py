@@ -5,6 +5,7 @@ import json
 import os
 import six
 from datetime import timedelta
+from six.moves import xrange
 
 # Django
 from django.core.urlresolvers import resolve
@@ -32,7 +33,8 @@ from awx.main.models.inventory import (
     Group,
     Inventory,
     InventoryUpdate,
-    InventorySource
+    InventorySource,
+    CustomInventoryScript
 )
 from awx.main.models.organization import (
     Organization,
@@ -45,6 +47,7 @@ from awx.main.models.notifications import (
 )
 from awx.main.models.workflow import WorkflowJobTemplate
 from awx.main.models.ad_hoc_commands import AdHocCommand
+from awx.main.models.oauth import OAuth2Application as Application
 
 __SWAGGER_REQUESTS__ = {}
 
@@ -497,6 +500,13 @@ def inventory_update(inventory_source):
 
 
 @pytest.fixture
+def inventory_script(organization):
+    return CustomInventoryScript.objects.create(name='test inv script',
+                                                organization=organization,
+                                                script='#!/usr/bin/python')
+
+
+@pytest.fixture
 def host(group, inventory):
     return group.hosts.create(name='single-host', inventory=inventory)
 
@@ -526,6 +536,9 @@ def _request(verb):
 
         view, view_args, view_kwargs = resolve(urlparse(url)[2])
         request = getattr(APIRequestFactory(), verb)(url, **kwargs)
+        if isinstance(kwargs.get('cookies', None), dict):
+            for key, value in kwargs['cookies'].items():
+                request.COOKIES[key] = value
         if middleware:
             middleware.process_request(request)
         if user:
@@ -536,7 +549,7 @@ def _request(verb):
             middleware.process_response(request, response)
         if expect:
             if response.status_code != expect:
-                if response.data is not None:
+                if getattr(response, 'data', None):
                     try:
                         data_copy = response.data.copy()
                         # Make translated strings printable
@@ -549,7 +562,6 @@ def _request(verb):
                                 response.data[key] = str(value)
                     except Exception:
                         response.data = data_copy
-                print(response.data)
             assert response.status_code == expect
         if hasattr(response, 'render'):
             response.render()
@@ -718,3 +730,11 @@ def get_db_prep_save(self, value, connection, **kwargs):
 @pytest.fixture
 def monkeypatch_jsonbfield_get_db_prep_save(mocker):
     JSONField.get_db_prep_save = get_db_prep_save
+
+
+@pytest.fixture
+def oauth_application(admin):
+    return Application.objects.create(
+        name='test app', user=admin, client_type='confidential',
+        authorization_grant_type='password'
+    )

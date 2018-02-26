@@ -74,7 +74,7 @@ class JSONField(upstream_JSONField):
 
 class JSONBField(upstream_JSONBField):
     def get_prep_lookup(self, lookup_type, value):
-        if isinstance(value, basestring) and value == "null":
+        if isinstance(value, six.string_types) and value == "null":
             return 'null'
         return super(JSONBField, self).get_prep_lookup(lookup_type, value)
 
@@ -356,7 +356,7 @@ class SmartFilterField(models.TextField):
         value = urllib.unquote(value)
         try:
             SmartFilter().query_from_string(value)
-        except RuntimeError, e:
+        except RuntimeError as e:
             raise models.base.ValidationError(e)
         return super(SmartFilterField, self).get_prep_value(value)
 
@@ -506,6 +506,12 @@ class CredentialInputField(JSONSchemaField):
                 v != '$encrypted$',
                 model_instance.pk
             ]):
+                if not isinstance(getattr(model_instance, k), six.string_types):
+                    raise django_exceptions.ValidationError(
+                        _('secret values must be of type string, not {}').format(type(v).__name__),
+                        code='invalid',
+                        params={'value': v},
+                    )
                 decrypted_values[k] = utils.decrypt_field(model_instance, k)
             else:
                 decrypted_values[k] = v
