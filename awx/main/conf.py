@@ -44,6 +44,16 @@ register(
 )
 
 register(
+    'MANAGE_ORGANIZATION_AUTH',
+    field_class=fields.BooleanField,
+    label=_('Organization Admins Can Manage Users and Teams'),
+    help_text=_('Controls whether any Organization Admin has the privileges to create and manage users and teams. '
+                'You may want to disable this ability if you are using an LDAP or SAML integration.'),
+    category=_('System'),
+    category_slug='system',
+)
+
+register(
     'TOWER_ADMIN_ALERTS',
     field_class=fields.BooleanField,
     label=_('Enable Administrator Alerts'),
@@ -411,7 +421,7 @@ register(
     field_class=fields.BooleanField,
     default=False,
     label=_('Log System Tracking Facts Individually'),
-    help_text=_('If set, system tracking facts will be sent for each package, service, or'
+    help_text=_('If set, system tracking facts will be sent for each package, service, or '
                 'other item found in a scan, allowing for greater search query granularity. '
                 'If unset, facts will be sent as a single dictionary, allowing for greater '
                 'efficiency in fact processing.'),

@@ -3,6 +3,9 @@
 # Copyright (c) 2017 Ansible Tower by Red Hat
 # All Rights Reserved.
 
+# Python
+import six
+
 # Django
 from django.conf import settings
 
@@ -13,7 +16,7 @@ from awx.main.models import Instance
 def _add_remove_celery_worker_queues(app, controlled_instances, worker_queues, worker_name):
     removed_queues = []
     added_queues = []
-    ig_names = set(['tower_instance_router'])
+    ig_names = set([six.text_type('tower_instance_router')])
     hostnames = set([instance.hostname for instance in controlled_instances])
     for instance in controlled_instances:
         ig_names.update(instance.rampart_groups.values_list('name', flat=True))
@@ -26,14 +29,14 @@ def _add_remove_celery_worker_queues(app, controlled_instances, worker_queues, w
             continue
 
         if queue['name'] not in ig_names | hostnames or not instance.enabled:
-            app.control.cancel_consumer(queue['name'], reply=True, destination=[worker_name])
-            removed_queues.append(queue['name'])
+            app.control.cancel_consumer(queue['name'].encode("utf8"), reply=True, destination=[worker_name])
+            removed_queues.append(queue['name'].encode("utf8"))
 
     # Add queues for instance and instance groups
     for queue_name in ig_names | hostnames:
         if queue_name not in worker_queue_names:
-            app.control.add_consumer(queue_name, reply=True, destination=[worker_name])
-            added_queues.append(queue_name)
+            app.control.add_consumer(queue_name.encode("utf8"), reply=True, destination=[worker_name])
+            added_queues.append(queue_name.encode("utf8"))
 
     return (added_queues, removed_queues)
 
@@ -48,12 +51,12 @@ def update_celery_worker_routes(instance, conf):
     if instance.is_controller():
         tasks.append('awx.main.tasks.awx_isolated_heartbeat')
     else:
-        if 'awx.main.tasks.awx_isolated_heartbeat' in conf.CELERY_TASK_ROUTES:
-            del conf.CELERY_TASK_ROUTES['awx.main.tasks.awx_isolated_heartbeat']
+        if 'awx.main.tasks.awx_isolated_heartbeat' in conf.CELERY_ROUTES:
+            del conf.CELERY_ROUTES['awx.main.tasks.awx_isolated_heartbeat']
 
     for t in tasks:
-        conf.CELERY_TASK_ROUTES[t] = {'queue': instance.hostname, 'routing_key': instance.hostname}
-        routes_updated[t] = conf.CELERY_TASK_ROUTES[t]
+        conf.CELERY_ROUTES[t] = {'queue': instance.hostname.encode("utf8"), 'routing_key': instance.hostname.encode("utf8")}
+        routes_updated[t] = conf.CELERY_ROUTES[t]
 
     return routes_updated
 

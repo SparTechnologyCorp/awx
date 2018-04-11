@@ -66,7 +66,7 @@
     padding: 10px;
     border-radius: 5px;
     max-height: 120px;
-    overflow-y: scroll;
+    overflow-y: auto;
 }
 .Prompt-selectedItemRevert {
     display: flex;
@@ -143,6 +143,7 @@
 }
 .Prompt-previewRowValue {
     flex: 1 0 auto;
+    max-width: 508px;
 }
 .Prompt-noSelectedItem {
     height: 30px;
@@ -163,4 +164,8 @@
 }
 .Prompt-credentialSubSection .select2 {
     width: 50% !important;
+}
+.Prompt-credentialTypeMissing {
+    margin-bottom: 20px;
+    color: @default-err;
 }

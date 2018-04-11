@@ -184,7 +184,6 @@ requirements_awx: virtualenv_awx
 
 requirements_awx_dev:
 	$(VENV_BASE)/awx/bin/pip install -r requirements/requirements_dev.txt
-	$(VENV_BASE)/awx/bin/pip uninstall --yes -r requirements/requirements_dev_uninstall.txt
 
 requirements: requirements_ansible requirements_awx
 
@@ -324,7 +323,7 @@ celeryd:
 	@if [ "$(VENV_BASE)" ]; then \
 		. $(VENV_BASE)/awx/bin/activate; \
 	fi; \
-	celery worker -A awx -l DEBUG -B -Ofair --autoscale=100,4 --schedule=$(CELERY_SCHEDULE_FILE) -Q tower_broadcast_all -n celery@$(COMPOSE_HOST) --pidfile /tmp/celery_pid
+	celery worker -A awx -l DEBUG -B -Ofair --autoscale=100,4 --schedule=$(CELERY_SCHEDULE_FILE) -n celery@$(COMPOSE_HOST) --pidfile /tmp/celery_pid
 
 # Run to start the zeromq callback receiver
 receiver:
@@ -335,9 +334,6 @@ receiver:
 
 nginx:
 	nginx -g "daemon off;"
-
-rdb:
-	$(PYTHON) tools/rdb.py
 
 jupyter:
 	@if [ "$(VENV_BASE)" ]; then \

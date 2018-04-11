@@ -17,7 +17,6 @@ from oauth2_provider.settings import oauth2_settings
 
 # Django
 from django.conf import settings
-from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError as DjangoValidationError
@@ -41,14 +40,15 @@ from polymorphic.models import PolymorphicModel
 # AWX
 from awx.main.constants import SCHEDULEABLE_PROVIDERS, ANSI_SGR_PATTERN
 from awx.main.models import * # noqa
-from awx.main.models.unified_jobs import ACTIVE_STATES
+from awx.main.constants import ACTIVE_STATES
 from awx.main.models.base import NEW_JOB_TYPE_CHOICES
 from awx.main.access import get_user_capabilities
 from awx.main.fields import ImplicitRoleField
 from awx.main.utils import (
     get_type_for_model, get_model_for_type, timestamp_apiformat,
     camelcase_to_underscore, getattrd, parse_yaml_or_json,
-    has_model_field_prefetched, extract_ansible_vars, encrypt_dict)
+    has_model_field_prefetched, extract_ansible_vars, encrypt_dict,
+    prefetch_page_capabilities)
 from awx.main.utils.filters import SmartFilter
 from awx.main.redact import REPLACE_STR
 
@@ -404,17 +404,46 @@ class BaseSerializer(serializers.ModelSerializer):
 
         # Advance display of RBAC capabilities
         if hasattr(self, 'show_capabilities'):
-            view = self.context.get('view', None)
-            parent_obj = None
-            if view and hasattr(view, 'parent_model') and hasattr(view, 'get_parent_object'):
-                parent_obj = view.get_parent_object()
-            if view and view.request and view.request.user:
-                user_capabilities = get_user_capabilities(
-                    view.request.user, obj, method_list=self.show_capabilities, parent_obj=parent_obj)
-                if user_capabilities:
-                    summary_fields['user_capabilities'] = user_capabilities
+            user_capabilities = self._obj_capability_dict(obj)
+            if user_capabilities:
+                summary_fields['user_capabilities'] = user_capabilities
 
         return summary_fields
+
+    def _obj_capability_dict(self, obj):
+        """
+        Returns the user_capabilities dictionary for a single item
+        If inside of a list view, it runs the prefetching algorithm for
+        the entire current page, saves it into context
+        """
+        view = self.context.get('view', None)
+        parent_obj = None
+        if view and hasattr(view, 'parent_model') and hasattr(view, 'get_parent_object'):
+            parent_obj = view.get_parent_object()
+        if view and view.request and view.request.user:
+            capabilities_cache = {}
+            # if serializer has parent, it is ListView, apply page capabilities prefetch
+            if self.parent and hasattr(self, 'capabilities_prefetch') and self.capabilities_prefetch:
+                qs = self.parent.instance
+                if 'capability_map' not in self.context:
+                    if hasattr(self, 'polymorphic_base'):
+                        model = self.polymorphic_base.Meta.model
+                        prefetch_list = self.polymorphic_base._capabilities_prefetch
+                    else:
+                        model = self.Meta.model
+                        prefetch_list = self.capabilities_prefetch
+                    self.context['capability_map'] = prefetch_page_capabilities(
+                        model, qs, prefetch_list, view.request.user
+                    )
+                if obj.id in self.context['capability_map']:
+                    capabilities_cache = self.context['capability_map'][obj.id]
+            return get_user_capabilities(
+                view.request.user, obj, method_list=self.show_capabilities, parent_obj=parent_obj,
+                capabilities_cache=capabilities_cache
+            )
+        else:
+            # Contextual information to produce user_capabilities doesn't exist
+            return {}
 
     def get_created(self, obj):
         if obj is None:
@@ -600,6 +629,12 @@ class BaseFactSerializer(BaseSerializer):
 
 
 class UnifiedJobTemplateSerializer(BaseSerializer):
+    # As a base serializer, the capabilities prefetch is not used directly
+    _capabilities_prefetch = [
+        'admin', 'execute',
+        {'copy': ['jobtemplate.project.use', 'jobtemplate.inventory.use',
+                  'workflowjobtemplate.organization.workflow_admin']}
+    ]
 
     class Meta:
         model = UnifiedJobTemplate
@@ -637,6 +672,15 @@ class UnifiedJobTemplateSerializer(BaseSerializer):
                 serializer_class = WorkflowJobTemplateSerializer
         if serializer_class:
             serializer = serializer_class(instance=obj, context=self.context)
+            # preserve links for list view
+            if self.parent:
+                serializer.parent = self.parent
+                serializer.polymorphic_base = self
+                # capabilities prefetch is only valid for these models
+                if isinstance(obj, (JobTemplate, WorkflowJobTemplate)):
+                    serializer.capabilities_prefetch = self._capabilities_prefetch
+                else:
+                    serializer.capabilities_prefetch = None
             return serializer.to_representation(obj)
         else:
             return super(UnifiedJobTemplateSerializer, self).to_representation(obj)
@@ -644,13 +688,18 @@ class UnifiedJobTemplateSerializer(BaseSerializer):
 
 class UnifiedJobSerializer(BaseSerializer):
     show_capabilities = ['start', 'delete']
+    event_processing_finished = serializers.BooleanField(
+        help_text=_('Indicates whether all of the events generated by this '
+                    'unified job have been saved to the database.'),
+        read_only=True
+    )
 
     class Meta:
         model = UnifiedJob
         fields = ('*', 'unified_job_template', 'launch_type', 'status',
                   'failed', 'started', 'finished', 'elapsed', 'job_args',
                   'job_cwd', 'job_env', 'job_explanation', 'execution_node',
-                  'result_traceback')
+                  'result_traceback', 'event_processing_finished')
         extra_kwargs = {
             'unified_job_template': {
                 'source': 'unified_job_template_id',
@@ -719,6 +768,11 @@ class UnifiedJobSerializer(BaseSerializer):
                 serializer_class = WorkflowJobSerializer
         if serializer_class:
             serializer = serializer_class(instance=obj, context=self.context)
+            # preserve links for list view
+            if self.parent:
+                serializer.parent = self.parent
+                serializer.polymorphic_base = self
+                # TODO: restrict models for capabilities prefetch, when it is added
             ret = serializer.to_representation(obj)
         else:
             ret = super(UnifiedJobSerializer, self).to_representation(obj)
@@ -735,13 +789,13 @@ class UnifiedJobSerializer(BaseSerializer):
 class UnifiedJobListSerializer(UnifiedJobSerializer):
 
     class Meta:
-        fields = ('*', '-job_args', '-job_cwd', '-job_env', '-result_traceback')
+        fields = ('*', '-job_args', '-job_cwd', '-job_env', '-result_traceback', '-event_processing_finished')
 
     def get_field_names(self, declared_fields, info):
         field_names = super(UnifiedJobListSerializer, self).get_field_names(declared_fields, info)
         # Meta multiple inheritance and -field_name options don't seem to be
         # taking effect above, so remove the undesired fields here.
-        return tuple(x for x in field_names if x not in ('job_args', 'job_cwd', 'job_env', 'result_traceback'))
+        return tuple(x for x in field_names if x not in ('job_args', 'job_cwd', 'job_env', 'result_traceback', 'event_processing_finished'))
 
     def get_types(self):
         if type(self) is UnifiedJobListSerializer:
@@ -940,7 +994,6 @@ class UserAuthorizedTokenSerializer(BaseSerializer):
             'expires', 'scope', 'application',
         )
         read_only_fields = ('user', 'token', 'expires')
-        read_only_on_update_fields = ('application',)
         
     def get_token(self, obj):
         request = self.context.get('request', None)
@@ -971,7 +1024,7 @@ class UserAuthorizedTokenSerializer(BaseSerializer):
         obj = super(OAuth2TokenSerializer, self).create(validated_data)
         obj.save()
         if obj.application is not None:
-            OAuth2RefreshToken.objects.create(
+            RefreshToken.objects.create(
                 user=self.context['request'].user,
                 token=generate_token(),
                 application=obj.application,
@@ -981,11 +1034,13 @@ class UserAuthorizedTokenSerializer(BaseSerializer):
         
 
 class OAuth2ApplicationSerializer(BaseSerializer):
-
+    
+    show_capabilities = ['edit', 'delete']
+    
     class Meta:
         model = OAuth2Application
         fields = (
-            '*', '-description', 'user', 'client_id', 'client_secret', 'client_type',
+            '*', 'description', 'user', 'client_id', 'client_secret', 'client_type',
             'redirect_uris',  'authorization_grant_type', 'skip_authorization',
         )
         read_only_fields = ('client_id', 'client_secret')
@@ -998,7 +1053,7 @@ class OAuth2ApplicationSerializer(BaseSerializer):
     def to_representation(self, obj):
         ret = super(OAuth2ApplicationSerializer, self).to_representation(obj)
         if obj.client_type == 'public':
-            ret.pop('client_secret')
+            ret.pop('client_secret', None)
         return ret
         
         
@@ -1098,7 +1153,7 @@ class OAuth2TokenSerializer(BaseSerializer):
             obj.user = obj.application.user
         obj.save()
         if obj.application is not None:
-            OAuth2RefreshToken.objects.create(
+            RefreshToken.objects.create(
                 user=obj.application.user if obj.application.user else None,
                 token=generate_token(),
                 application=obj.application,
@@ -1106,6 +1161,12 @@ class OAuth2TokenSerializer(BaseSerializer):
             )
         return obj
         
+        
+class OAuth2TokenDetailSerializer(OAuth2TokenSerializer):
+
+    class Meta:
+        read_only_fields = ('*', 'user', 'application')       
+
 
 class OAuth2AuthorizedTokenSerializer(BaseSerializer):
     
@@ -1119,7 +1180,6 @@ class OAuth2AuthorizedTokenSerializer(BaseSerializer):
             'expires', 'scope', 'application',
         )
         read_only_fields = ('user', 'token', 'expires')
-        read_only_on_update_fields = ('application',)
         
     def get_token(self, obj):
         request = self.context.get('request', None)
@@ -1152,7 +1212,7 @@ class OAuth2AuthorizedTokenSerializer(BaseSerializer):
             obj.user = obj.application.user
         obj.save()
         if obj.application is not None:
-            OAuth2RefreshToken.objects.create(
+            RefreshToken.objects.create(
                 user=obj.application.user if obj.application.user else None,
                 token=generate_token(),
                 application=obj.application,
@@ -1172,8 +1232,7 @@ class OAuth2PersonalTokenSerializer(BaseSerializer):
             '*', '-name', 'description', 'user', 'token', 'refresh_token',
             'application', 'expires', 'scope',
         )
-        read_only_fields = ('user', 'token', 'expires')
-        read_only_on_update_fields = ('application',)
+        read_only_fields = ('user', 'token', 'expires', 'application')
 
     def get_modified(self, obj):
         if obj is None:
@@ -1305,7 +1364,11 @@ class ProjectSerializer(UnifiedJobTemplateSerializer, ProjectOptionsSerializer):
     status = serializers.ChoiceField(choices=Project.PROJECT_STATUS_CHOICES, read_only=True)
     last_update_failed = serializers.BooleanField(read_only=True)
     last_updated = serializers.DateTimeField(read_only=True)
-    show_capabilities = ['start', 'schedule', 'edit', 'delete']
+    show_capabilities = ['start', 'schedule', 'edit', 'delete', 'copy']
+    capabilities_prefetch = [
+        'admin', 'update',
+        {'copy': 'organization.project_admin'}
+    ]
 
     class Meta:
         model = Project
@@ -1457,7 +1520,11 @@ class BaseSerializerWithVariables(BaseSerializer):
 
 
 class InventorySerializer(BaseSerializerWithVariables):
-    show_capabilities = ['edit', 'delete', 'adhoc']
+    show_capabilities = ['edit', 'delete', 'adhoc', 'copy']
+    capabilities_prefetch = [
+        'admin', 'adhoc',
+        {'copy': 'organization.inventory_admin'}
+    ]
 
     class Meta:
         model = Inventory
@@ -1547,6 +1614,7 @@ class InventoryScriptSerializer(InventorySerializer):
 
 class HostSerializer(BaseSerializerWithVariables):
     show_capabilities = ['edit', 'delete']
+    capabilities_prefetch = ['inventory.admin']
 
     class Meta:
         model = Host
@@ -1676,6 +1744,7 @@ class AnsibleFactsSerializer(BaseSerializer):
 
 
 class GroupSerializer(BaseSerializerWithVariables):
+    capabilities_prefetch = ['inventory.admin', 'inventory.adhoc']
 
     class Meta:
         model = Group
@@ -1815,7 +1884,10 @@ class GroupVariableDataSerializer(BaseVariableDataSerializer):
 class CustomInventoryScriptSerializer(BaseSerializer):
 
     script = serializers.CharField(trim_whitespace=False)
-    show_capabilities = ['edit', 'delete']
+    show_capabilities = ['edit', 'delete', 'copy']
+    capabilities_prefetch = [
+        {'edit': 'organization.admin'}
+    ]
 
     class Meta:
         model = CustomInventoryScript
@@ -1925,6 +1997,10 @@ class InventorySourceSerializer(UnifiedJobTemplateSerializer, InventorySourceOpt
     last_update_failed = serializers.BooleanField(read_only=True)
     last_updated = serializers.DateTimeField(read_only=True)
     show_capabilities = ['start', 'schedule', 'edit', 'delete']
+    capabilities_prefetch = [
+        {'admin': 'inventory.admin'},
+        {'start': 'inventory.update'}
+    ]
     group = serializers.SerializerMethodField(
         help_text=_('Automatic group relationship, will be removed in 3.3'))
 
@@ -2431,7 +2507,8 @@ class V2CredentialFields(BaseSerializer):
 
 
 class CredentialSerializer(BaseSerializer):
-    show_capabilities = ['edit', 'delete']
+    show_capabilities = ['edit', 'delete', 'copy']
+    capabilities_prefetch = ['admin', 'use']
 
     class Meta:
         model = Credential
@@ -2926,6 +3003,10 @@ class JobTemplateMixin(object):
 
 class JobTemplateSerializer(JobTemplateMixin, UnifiedJobTemplateSerializer, JobOptionsSerializer):
     show_capabilities = ['start', 'schedule', 'copy', 'edit', 'delete']
+    capabilities_prefetch = [
+        'admin', 'execute',
+        {'copy': ['project.use', 'inventory.use']}
+    ]
 
     status = serializers.ChoiceField(choices=JobTemplate.JOB_TEMPLATE_STATUS_CHOICES, read_only=True, required=False)
 
@@ -3149,17 +3230,20 @@ class JobRelaunchSerializer(BaseSerializer):
         ],
         write_only=True
     )
+    credential_passwords = VerbatimField(required=True, write_only=True)
 
     class Meta:
         model = Job
-        fields = ('passwords_needed_to_start', 'retry_counts', 'hosts',)
+        fields = ('passwords_needed_to_start', 'retry_counts', 'hosts', 'credential_passwords',)
 
-    def to_internal_value(self, data):
-        obj = self.context.get('obj')
-        all_data = self.to_representation(obj)
-        all_data.update(data)
-        ret = super(JobRelaunchSerializer, self).to_internal_value(all_data)
-        return ret
+    def validate_credential_passwords(self, value):
+        pnts = self.instance.passwords_needed_to_start
+        missing = set(pnts) - set(key for key in value if value[key])
+        if missing:
+            raise serializers.ValidationError(_(
+                'Missing passwords needed to start: {}'.format(', '.join(missing))
+            ))
+        return value
 
     def to_representation(self, obj):
         res = super(JobRelaunchSerializer, self).to_representation(obj)
@@ -3182,24 +3266,17 @@ class JobRelaunchSerializer(BaseSerializer):
             data[status] = obj.retry_qs(status).count()
         return data
 
-    def validate_passwords_needed_to_start(self, value):
-        obj = self.context.get('obj')
-        data = self.context.get('data')
-
-        # Check for passwords needed
-        needed = self.get_passwords_needed_to_start(obj)
-        provided = dict([(field, data.get(field, '')) for field in needed])
-        if not all(provided.values()):
-            raise serializers.ValidationError(needed)
-        return value
+    def get_validation_exclusions(self, *args, **kwargs):
+        r = super(JobRelaunchSerializer, self).get_validation_exclusions(*args, **kwargs)
+        r.append('credential_passwords')
+        return r
 
     def validate(self, attrs):
-        obj = self.context.get('obj')
+        obj = self.instance
         if obj.project is None:
             raise serializers.ValidationError(dict(errors=[_("Job Template Project is missing or undefined.")]))
         if obj.inventory is None or obj.inventory.pending_deletion:
             raise serializers.ValidationError(dict(errors=[_("Job Template Inventory is missing or undefined.")]))
-        attrs.pop('hosts', None)
         attrs = super(JobRelaunchSerializer, self).validate(attrs)
         return attrs
 
@@ -3374,7 +3451,7 @@ class SystemJobSerializer(UnifiedJobSerializer):
         except StdoutMaxBytesExceeded as e:
             return _(
                 "Standard Output too large to display ({text_size} bytes), "
-                "only download supported for sizes over {supported_size} bytes").format(
+                "only download supported for sizes over {supported_size} bytes.").format(
                     text_size=e.total, supported_size=e.supported
             )
 
@@ -3389,6 +3466,10 @@ class SystemJobCancelSerializer(SystemJobSerializer):
 
 class WorkflowJobTemplateSerializer(JobTemplateMixin, LabelsListMixin, UnifiedJobTemplateSerializer):
     show_capabilities = ['start', 'schedule', 'edit', 'copy', 'delete']
+    capabilities_prefetch = [
+        'admin', 'execute',
+        {'copy': 'organization.workflow_admin'}
+    ]
 
     class Meta:
         model = WorkflowJobTemplate
@@ -3430,7 +3511,8 @@ class WorkflowJobSerializer(LabelsListMixin, UnifiedJobSerializer):
 
     class Meta:
         model = WorkflowJob
-        fields = ('*', 'workflow_job_template', 'extra_vars', 'allow_simultaneous', '-execution_node',)
+        fields = ('*', 'workflow_job_template', 'extra_vars', 'allow_simultaneous',
+                  '-execution_node', '-event_processing_finished',)
 
     def get_related(self, obj):
         res = super(WorkflowJobSerializer, self).get_related(obj)
@@ -4203,7 +4285,8 @@ class WorkflowJobLaunchSerializer(BaseSerializer):
 
 
 class NotificationTemplateSerializer(BaseSerializer):
-    show_capabilities = ['edit', 'delete']
+    show_capabilities = ['edit', 'delete', 'copy']
+    capabilities_prefetch = [{'copy': 'organization.admin'}]
 
     class Meta:
         model = NotificationTemplate
@@ -4662,26 +4745,6 @@ class ActivityStreamSerializer(BaseSerializer):
             summary_fields['setting'] = [obj.setting]
         summary_fields['access_token'] = '*************'    
         return summary_fields
-
-
-class AuthTokenSerializer(serializers.Serializer):
-
-    username = serializers.CharField()
-    password = serializers.CharField()
-
-    def validate(self, attrs):
-        username = attrs.get('username')
-        password = attrs.get('password')
-
-        if username and password:
-            user = authenticate(username=username, password=password)
-            if user:
-                attrs['user'] = user
-                return attrs
-            else:
-                raise serializers.ValidationError(_('Unable to login with provided credentials.'))
-        else:
-            raise serializers.ValidationError(_('Must include "username" and "password".'))
 
 
 class FactVersionSerializer(BaseFactSerializer):

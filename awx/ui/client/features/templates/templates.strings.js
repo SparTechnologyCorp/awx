@@ -51,11 +51,13 @@ function TemplatesStrings (BaseString) {
         CHOOSE_VERBOSITY: t.s('Choose a verbosity'),
         EXTRA_VARIABLES: t.s('Extra Variables'),
         PLEASE_ENTER_ANSWER: t.s('Please enter an answer.'),
+        PLEASE_SELECT_VALUE: t.s('Please select a value'),
         VALID_INTEGER: t.s('Please enter an answer that is a valid integer.'),
         VALID_DECIMAL: t.s('Please enter an answer that is a decimal number.'),
         PLAYBOOK_RUN: t.s('Playbook Run'),
         CHECK: t.s('Check'),
-        NO_CREDS_MATCHING_TYPE: t.s('No Credentials Matching This Type Have Been Created'), 
+        NO_CREDS_MATCHING_TYPE: t.s('No Credentials Matching This Type Have Been Created'),
+        CREDENTIAL_TYPE_MISSING: typeLabel => t.s('This job template has a default {{typeLabel}} credential which must be included or replaced before proceeding.', { typeLabel })
     };
 
     ns.alert  = {
@@ -81,11 +83,12 @@ function TemplatesStrings (BaseString) {
         UNKNOWN: t.s('Unable to determine template type.'),
         SCHEDULE: t.s('Unable to schedule job.'),
         COPY: t.s('Unable to copy template.'),
+        INVALID: t.s('Resources are missing from this template.')
     };
 
     ns.warnings = {
         WORKFLOW_RESTRICTED_COPY: t.s('You do not have access to all resources used by this workflow. Resources that you don\'t have access to will not be copied and will result in an incomplete workflow.')
-    }
+    };
 }
 
 TemplatesStrings.$inject = ['BaseStringService'];

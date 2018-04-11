@@ -35,7 +35,14 @@ from awx.main.models.notifications import (
 )
 from awx.main.utils import parse_yaml_or_json
 from awx.main.fields import ImplicitRoleField
-from awx.main.models.mixins import ResourceMixin, SurveyJobTemplateMixin, SurveyJobMixin, TaskManagerJobMixin, CustomVirtualEnvMixin
+from awx.main.models.mixins import (
+    ResourceMixin,
+    SurveyJobTemplateMixin,
+    SurveyJobMixin,
+    TaskManagerJobMixin,
+    CustomVirtualEnvMixin,
+    RelatedJobsMixin,
+)
 from awx.main.fields import JSONField, AskForField
 
 
@@ -216,7 +223,7 @@ class JobOptions(BaseModel):
         return needed
 
 
-class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, ResourceMixin, CustomVirtualEnvMixin):
+class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin):
     '''
     A job template is a reusable job definition for applying a project (with
     playbook) to an inventory source with a given credential.
@@ -443,6 +450,12 @@ class JobTemplate(UnifiedJobTemplate, JobOptions, SurveyJobTemplateMixin, Resour
             any_notification_templates = set(any_notification_templates + list(base_notification_templates.filter(
                 organization_notification_templates_for_any=self.project.organization)))
         return dict(error=list(error_notification_templates), success=list(success_notification_templates), any=list(any_notification_templates))
+
+    '''
+    RelatedJobsMixin
+    '''
+    def _get_related_jobs(self):
+        return Job.objects.filter(job_template=self)
 
 
 class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskManagerJobMixin):
@@ -950,7 +963,17 @@ class JobLaunchConfig(LaunchTimeConfig):
         launching with those prompts
         '''
         prompts = self.prompts_dict()
-        for field_name, ask_field_name in template.get_ask_mapping().items():
+        ask_mapping = template.get_ask_mapping()
+        if template.survey_enabled and (not template.ask_variables_on_launch):
+            ask_mapping.pop('extra_vars')
+            provided_vars = set(prompts['extra_vars'].keys())
+            survey_vars = set(
+                element.get('variable') for element in
+                template.survey_spec.get('spec', {}) if 'variable' in element
+            )
+            if provided_vars - survey_vars:
+                return True
+        for field_name, ask_field_name in ask_mapping.items():
             if field_name in prompts and not getattr(template, ask_field_name):
                 return True
         else:

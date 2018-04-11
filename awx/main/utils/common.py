@@ -32,6 +32,7 @@ from django.db import DatabaseError
 from django.utils.translation import ugettext_lazy as _
 from django.db.models.fields.related import ForeignObjectRel, ManyToManyField
 from django.db.models.query import QuerySet
+from django.db.models import Q
 
 # Django REST Framework
 from rest_framework.exceptions import ParseError, PermissionDenied
@@ -43,8 +44,8 @@ logger = logging.getLogger('awx.main.utils')
 
 __all__ = ['get_object_or_400', 'get_object_or_403', 'camelcase_to_underscore', 'memoize', 'memoize_delete',
            'get_ansible_version', 'get_ssh_version', 'get_licenser', 'get_awx_version', 'update_scm_url',
-           'get_type_for_model', 'get_model_for_type', 'copy_model_by_class',
-           'copy_m2m_relationships', 'cache_list_capabilities', 'to_python_boolean',
+           'get_type_for_model', 'get_model_for_type', 'copy_model_by_class', 'region_sorting',
+           'copy_m2m_relationships', 'prefetch_page_capabilities', 'to_python_boolean',
            'ignore_inventory_computed_fields', 'ignore_inventory_group_removal',
            '_inventory_updates', 'get_pk_from_dict', 'getattrd', 'NoDefaultProvided',
            'get_current_apps', 'set_current_apps', 'OutputEventFilter',
@@ -94,6 +95,14 @@ def to_python_boolean(value, allow_none=False):
         return None
     else:
         raise ValueError(_(u'Unable to convert "%s" to boolean') % six.text_type(value))
+
+
+def region_sorting(region):
+        if region[1].lower() == 'all':
+            return -1
+        elif region[1].lower().startswith('us'):
+            return 0
+        return region[1]
 
 
 def camelcase_to_underscore(s):
@@ -335,18 +344,18 @@ def update_scm_url(scm_type, url, username=True, password=True,
 
 
 def get_allowed_fields(obj, serializer_mapping):
-    from django.contrib.auth.models import User
 
     if serializer_mapping is not None and obj.__class__ in serializer_mapping:
         serializer_actual = serializer_mapping[obj.__class__]()
         allowed_fields = [x for x in serializer_actual.fields if not serializer_actual.fields[x].read_only] + ['id']
     else:
         allowed_fields = [x.name for x in obj._meta.fields]
-
-    if isinstance(obj, User):
+    if obj._meta.model_name == 'user':
         field_blacklist = ['last_login']
         allowed_fields = [f for f in allowed_fields if f not in field_blacklist]
-
+    if obj._meta.model_name == 'oauth2application':
+        field_blacklist = ['client_secret']
+        allowed_fields = [f for f in allowed_fields if f not in field_blacklist]
     return allowed_fields
 
 
@@ -503,7 +512,6 @@ def get_model_for_type(type):
     '''
     Return model class for a given type name.
     '''
-    from django.db.models import Q
     from django.contrib.contenttypes.models import ContentType
     for ct in ContentType.objects.filter(Q(app_label='main') | Q(app_label='auth', model='user')):
         ct_model = ct.model_class()
@@ -516,30 +524,31 @@ def get_model_for_type(type):
         raise DatabaseError('"{}" is not a valid AWX model.'.format(type))
 
 
-def cache_list_capabilities(page, prefetch_list, model, user):
+def prefetch_page_capabilities(model, page, prefetch_list, user):
     '''
-    Given a `page` list of objects, the specified roles for the specified user
-    are save on each object in the list, using 1 query for each role type
+    Given a `page` list of objects, a nested dictionary of user_capabilities
+    are returned by id, ex.
+    {
+        4: {'edit': True, 'start': True},
+        6: {'edit': False, 'start': False}
+    }
+    Each capability is produced for all items in the page in a single query
 
-    Examples:
-    capabilities_prefetch = ['admin', 'execute']
+    Examples of prefetch language:
+    prefetch_list = ['admin', 'execute']
       --> prefetch the admin (edit) and execute (start) permissions for
           items in list for current user
-    capabilities_prefetch = ['inventory.admin']
+    prefetch_list = ['inventory.admin']
       --> prefetch the related inventory FK permissions for current user,
           and put it into the object's cache
-    capabilities_prefetch = [{'copy': ['inventory.admin', 'project.admin']}]
+    prefetch_list = [{'copy': ['inventory.admin', 'project.admin']}]
       --> prefetch logical combination of admin permission to inventory AND
           project, put into cache dictionary as "copy"
     '''
-    from django.db.models import Q
     page_ids = [obj.id for obj in page]
+    mapping = {}
     for obj in page:
-        obj.capabilities_cache = {}
-
-    skip_models = []
-    if hasattr(model, 'invalid_user_capabilities_prefetch_models'):
-        skip_models = model.invalid_user_capabilities_prefetch_models()
+        mapping[obj.id] = {}
 
     for prefetch_entry in prefetch_list:
 
@@ -583,11 +592,9 @@ def cache_list_capabilities(page, prefetch_list, model, user):
 
         # Save data item-by-item
         for obj in page:
-            if skip_models and obj.__class__.__name__.lower() in skip_models:
-                continue
-            obj.capabilities_cache[display_method] = False
-            if obj.pk in ids_with_role:
-                obj.capabilities_cache[display_method] = True
+            mapping[obj.pk][display_method] = bool(obj.pk in ids_with_role)
+
+    return mapping
 
 
 def validate_vars_type(vars_obj):
@@ -639,6 +646,15 @@ def get_cpu_capacity():
     from django.conf import settings
     settings_forkcpu = getattr(settings, 'SYSTEM_TASK_FORKS_CPU', None)
     env_forkcpu = os.getenv('SYSTEM_TASK_FORKS_CPU', None)
+
+    settings_abscpu = getattr(settings, 'SYSTEM_TASK_ABS_CPU', None)
+    env_abscpu = os.getenv('SYSTEM_TASK_ABS_CPU', None)
+
+    if env_abscpu is not None:
+        return 0, int(env_abscpu)
+    elif settings_abscpu is not None:
+        return 0, int(settings_abscpu)
+
     cpu = psutil.cpu_count()
 
     if env_forkcpu:
@@ -654,6 +670,15 @@ def get_mem_capacity():
     from django.conf import settings
     settings_forkmem = getattr(settings, 'SYSTEM_TASK_FORKS_MEM', None)
     env_forkmem = os.getenv('SYSTEM_TASK_FORKS_MEM', None)
+
+    settings_absmem = getattr(settings, 'SYSTEM_TASK_ABS_MEM', None)
+    env_absmem = os.getenv('SYSTEM_TASK_ABS_MEM', None)
+
+    if env_absmem is not None:
+        return 0, int(env_absmem)
+    elif settings_absmem is not None:
+        return 0, int(settings_absmem)
+
     if env_forkmem:
         forkmem = int(env_forkmem)
     elif settings_forkmem:

@@ -1,5 +1,7 @@
 import atLibServices from '~services';
 
+import Application from '~models/Application';
+import AdHocCommand from '~models/AdHocCommand';
 import Base from '~models/Base';
 import Config from '~models/Config';
 import Credential from '~models/Credential';
@@ -16,10 +18,12 @@ import ModelsStrings from '~models/models.strings';
 import NotificationTemplate from '~models/NotificationTemplate';
 import Organization from '~models/Organization';
 import Project from '~models/Project';
+import Schedule from '~models/Schedule';
 import UnifiedJobTemplate from '~models/UnifiedJobTemplate';
 import WorkflowJob from '~models/WorkflowJob';
 import WorkflowJobTemplate from '~models/WorkflowJobTemplate';
 import WorkflowJobTemplateNode from '~models/WorkflowJobTemplateNode';
+import UnifiedJob from '~models/UnifiedJob';
 
 const MODULE_NAME = 'at.lib.models';
 
@@ -27,6 +31,8 @@ angular
     .module(MODULE_NAME, [
         atLibServices
     ])
+    .service('ApplicationModel', Application)
+    .service('AdHocCommandModel', AdHocCommand)
     .service('BaseModel', Base)
     .service('ConfigModel', Config)
     .service('CredentialModel', Credential)
@@ -43,6 +49,8 @@ angular
     .service('NotificationTemplate', NotificationTemplate)
     .service('OrganizationModel', Organization)
     .service('ProjectModel', Project)
+    .service('ScheduleModel', Schedule)
+    .service('UnifiedJobModel', UnifiedJob)
     .service('UnifiedJobTemplateModel', UnifiedJobTemplate)
     .service('WorkflowJobModel', WorkflowJob)
     .service('WorkflowJobTemplateModel', WorkflowJobTemplate)

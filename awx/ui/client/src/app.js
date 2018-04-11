@@ -10,7 +10,6 @@ if ($basePath) {
 }
 
 import start from './app.start';
-
 import portalMode from './portal-mode/main';
 import systemTracking from './system-tracking/main';
 import inventoriesHosts from './inventories-hosts/main';
@@ -33,7 +32,6 @@ import login from './login/main';
 import activityStream from './activity-stream/main';
 import standardOut from './standard-out/main';
 import Templates from './templates/main';
-import jobs from './jobs/main';
 import teams from './teams/main';
 import users from './users/main';
 import projects from './projects/main';
@@ -46,6 +44,8 @@ import atFeatures from '~features';
 import atLibComponents from '~components';
 import atLibModels from '~models';
 import atLibServices from '~services';
+
+import networkUI from '~network-ui/main';
 
 start.bootstrap(() => {
     angular.bootstrap(document.body, ['awApp']);
@@ -92,11 +92,11 @@ angular
         standardOut.name,
         Templates.name,
         portalMode.name,
-        jobs.name,
         teams.name,
         users.name,
         projects.name,
         scheduler.name,
+        networkUI.tower.name,
 
         'Utilities',
         'templates',
@@ -317,7 +317,6 @@ angular
                 });
 
                 $transitions.onSuccess({}, function(trans) {
-
                     if(trans.to() === trans.from()) {
                         // check to see if something other than a search param has changed
                         let toParamsWithoutSearchKeys = {};

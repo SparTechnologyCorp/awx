@@ -66,14 +66,15 @@ class LoggedLoginView(auth_views.LoginView):
         original_user = getattr(request, 'user', None)
         ret = super(LoggedLoginView, self).post(request, *args, **kwargs)
         current_user = getattr(request, 'user', None)
+
         if current_user and getattr(current_user, 'pk', None) and current_user != original_user:
             logger.info("User {} logged in.".format(current_user.username))
         if request.user.is_authenticated:
             return ret
         else:
-            ret.status = 401
+            ret.status_code = 401
             return ret
-            
+
 
 class LoggedLogoutView(auth_views.LogoutView):
 
@@ -354,13 +355,6 @@ class ListAPIView(generics.ListAPIView, GenericAPIView):
 
     def get_queryset(self):
         return self.request.user.get_queryset(self.model)
-
-    def paginate_queryset(self, queryset):
-        page = super(ListAPIView, self).paginate_queryset(queryset)
-        # Queries RBAC info & stores into list objects
-        if hasattr(self, 'capabilities_prefetch') and page is not None:
-            cache_list_capabilities(page, self.capabilities_prefetch, self.model, self.request.user)
-        return page
 
     def get_description_context(self):
         if 'username' in get_all_field_names(self.model):

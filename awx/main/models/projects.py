@@ -25,8 +25,16 @@ from awx.main.models.notifications import (
     NotificationTemplate,
     JobNotificationMixin,
 )
-from awx.main.models.unified_jobs import * # noqa
-from awx.main.models.mixins import ResourceMixin, TaskManagerProjectUpdateMixin, CustomVirtualEnvMixin
+from awx.main.models.unified_jobs import (
+    UnifiedJob,
+    UnifiedJobTemplate,
+)
+from awx.main.models.mixins import (
+    ResourceMixin,
+    TaskManagerProjectUpdateMixin,
+    CustomVirtualEnvMixin,
+    RelatedJobsMixin
+)
 from awx.main.utils import update_scm_url
 from awx.main.utils.ansible import skip_directory, could_be_inventory, could_be_playbook
 from awx.main.fields import ImplicitRoleField
@@ -225,7 +233,7 @@ class ProjectOptions(models.Model):
         return proj_path + '.lock'
 
 
-class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEnvMixin):
+class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin):
     '''
     A project represents a playbook git repo that can access a set of inventories
     '''
@@ -442,6 +450,15 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
     def get_absolute_url(self, request=None):
         return reverse('api:project_detail', kwargs={'pk': self.pk}, request=request)
 
+    '''
+    RelatedJobsMixin
+    '''
+    def _get_related_jobs(self):
+        return UnifiedJob.objects.non_polymorphic().filter(
+            models.Q(Job___project=self) |
+            models.Q(ProjectUpdate___project=self)
+        )
+
 
 class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManagerProjectUpdateMixin):
     '''
@@ -533,7 +550,8 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
         res = super(ProjectUpdate, self).cancel(job_explanation=job_explanation, is_chain=is_chain)
         if res and self.launch_type != 'sync':
             for inv_src in self.scm_inventory_updates.filter(status='running'):
-                inv_src.cancel(job_explanation='Source project update `{}` was canceled.'.format(self.name))
+                inv_src.cancel(job_explanation=six.text_type(
+                    'Source project update `{}` was canceled.').format(self.name))
         return res
 
     '''
@@ -556,3 +574,5 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
         if not selected_groups:
             return self.global_instance_groups
         return selected_groups
+
+

@@ -22,7 +22,7 @@
                     <div class="JobResults-panelHeaderButtonActions">
 
                         <!-- RELAUNCH ACTION -->
-                        <at-relaunch state="job"></at-relaunch>
+                        <at-relaunch job="job"></at-relaunch>
 
                         <!-- CANCEL ACTION -->
                         <button class="List-actionButton
@@ -211,7 +211,7 @@
                         <div class="JobResults-resultRowText">
                             <a href="{{ project_update_link }}"
                                 ng-hide="job.summary_fields.project.scm_type==='' || !project_status"
-                                aw-tool-tip="{{'View project sync results' | translate}}"
+                                aw-tool-tip="{{'View project checkout results' | translate}}"
                                 data-placement="top">
                                 <i class="JobResults-statusResultIcon
                                     fa icon-job-{{ project_status }}">

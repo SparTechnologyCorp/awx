@@ -28,7 +28,7 @@ from rest_framework.exceptions import ParseError
 from polymorphic.models import PolymorphicModel
 
 # Django-Celery
-from django_celery_results.models import TaskResult
+from djcelery.models import TaskMeta
 
 # AWX
 from awx.main.models.base import * # noqa
@@ -38,6 +38,7 @@ from awx.main.utils import (
     copy_model_by_class, copy_m2m_relationships,
     get_type_for_model, parse_yaml_or_json
 )
+from awx.main.constants import ACTIVE_STATES, CAN_CANCEL
 from awx.main.redact import UriCleaner, REPLACE_STR
 from awx.main.consumers import emit_channel_notification
 from awx.main.fields import JSONField, AskForField
@@ -46,8 +47,7 @@ __all__ = ['UnifiedJobTemplate', 'UnifiedJob', 'StdoutMaxBytesExceeded']
 
 logger = logging.getLogger('awx.main.models.unified_jobs')
 
-CAN_CANCEL = ('new', 'pending', 'waiting', 'running')
-ACTIVE_STATES = CAN_CANCEL
+# NOTE: ACTIVE_STATES moved to constants because it is used by parent modules
 
 
 class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, NotificationFieldsModel):
@@ -179,12 +179,6 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, Notificatio
             return [x for x in unique_check if x != 'polymorphic_ctype']
         else:
             return super(UnifiedJobTemplate, self).unique_error_message(model_class, unique_check)
-
-    @classmethod
-    def invalid_user_capabilities_prefetch_models(cls):
-        if cls != UnifiedJobTemplate:
-            return []
-        return ['project', 'inventorysource', 'systemjobtemplate']
 
     @classmethod
     def _submodels_with_roles(cls):
@@ -553,6 +547,10 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
         default=None,
         editable=False,
     )
+    emitted_events = models.PositiveIntegerField(
+        default=0,
+        editable=False,
+    )
     unified_job_template = models.ForeignKey(
         'UnifiedJobTemplate',
         null=True, # Some jobs can be run without a template.
@@ -875,8 +873,11 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
         JobLaunchConfig = self._meta.get_field('launch_config').related_model
         config = JobLaunchConfig(job=self)
         valid_fields = self.unified_job_template.get_ask_mapping().keys()
+        # Special cases allowed for workflows
         if hasattr(self, 'extra_vars'):
             valid_fields.extend(['survey_passwords', 'extra_vars'])
+        else:
+            kwargs.pop('survey_passwords', None)
         for field_name, value in kwargs.items():
             if field_name not in valid_fields:
                 raise Exception('Unrecognized launch config field {}.'.format(field_name))
@@ -910,6 +911,33 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
         related = UnifiedJobDeprecatedStdout.objects.get(pk=self.pk)
         related.result_stdout_text = value
         related.save()
+
+    @property
+    def event_parent_key(self):
+        tablename = self._meta.db_table
+        return {
+            'main_job': 'job_id',
+            'main_adhoccommand': 'ad_hoc_command_id',
+            'main_projectupdate': 'project_update_id',
+            'main_inventoryupdate': 'inventory_update_id',
+            'main_systemjob': 'system_job_id',
+        }[tablename]
+
+    def get_event_queryset(self):
+        return self.event_class.objects.filter(**{self.event_parent_key: self.id})
+
+    @property
+    def event_processing_finished(self):
+        '''
+        Returns True / False, whether all events from job have been saved
+        '''
+        if self.status in ACTIVE_STATES:
+            return False  # tally of events is only available at end of run
+        try:
+            event_qs = self.get_event_queryset()
+        except NotImplementedError:
+            return True  # Model without events, such as WFJT
+        return self.emitted_events == event_qs.count()
 
     def result_stdout_raw_handle(self, enforce_max_bytes=True):
         """
@@ -966,20 +994,12 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
             # (`stdout`) directly to a file
 
             with connection.cursor() as cursor:
-                tablename = self._meta.db_table
-                related_name = {
-                    'main_job': 'job_id',
-                    'main_adhoccommand': 'ad_hoc_command_id',
-                    'main_projectupdate': 'project_update_id',
-                    'main_inventoryupdate': 'inventory_update_id',
-                    'main_systemjob': 'system_job_id',
-                }[tablename]
 
                 if enforce_max_bytes:
                     # detect the length of all stdout for this UnifiedJob, and
                     # if it exceeds settings.STDOUT_MAX_BYTES_DISPLAY bytes,
                     # don't bother actually fetching the data
-                    total = self.event_class.objects.filter(**{related_name: self.id}).aggregate(
+                    total = self.get_event_queryset().aggregate(
                         total=models.Sum(models.Func(models.F('stdout'), function='LENGTH'))
                     )['total']
                     if total > max_supported:
@@ -987,8 +1007,8 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
 
                 cursor.copy_expert(
                     "copy (select stdout from {} where {}={} order by start_line) to stdout".format(
-                        tablename + 'event',
-                        related_name,
+                        self._meta.db_table + 'event',
+                        self.event_parent_key,
                         self.id
                     ),
                     fd
@@ -1093,8 +1113,8 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
     def celery_task(self):
         try:
             if self.celery_task_id:
-                return TaskResult.objects.get(task_id=self.celery_task_id)
-        except TaskResult.DoesNotExist:
+                return TaskMeta.objects.get(task_id=self.celery_task_id)
+        except TaskMeta.DoesNotExist:
             pass
 
     def get_passwords_needed_to_start(self):
@@ -1335,7 +1355,7 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
                     cancel_fields.append('job_explanation')
                 self.save(update_fields=cancel_fields)
                 self.websocket_emit_status("canceled")
-            if settings.CELERY_BROKER_URL.startswith('amqp://'):
+            if settings.BROKER_URL.startswith('amqp://'):
                 self._force_cancel()
         return self.cancel_flag
 
@@ -1370,6 +1390,9 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
             for name in ('awx', 'tower'):
                 r['{}_user_id'.format(name)] = self.created_by.pk
                 r['{}_user_name'.format(name)] = self.created_by.username
+                r['{}_user_email'.format(name)] = self.created_by.email
+                r['{}_user_first_name'.format(name)] = self.created_by.first_name
+                r['{}_user_last_name'.format(name)] = self.created_by.last_name
         else:
             wj = self.get_workflow_job()
             if wj:

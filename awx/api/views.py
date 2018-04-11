@@ -77,13 +77,20 @@ from awx.main.utils import (
 from awx.main.utils.encryption import encrypt_value
 from awx.main.utils.filters import SmartFilter
 from awx.main.utils.insights import filter_insights_api_response
-
-from awx.api.permissions import * # noqa
+from awx.api.permissions import (
+    JobTemplateCallbackPermission,
+    TaskPermission,
+    ProjectUpdatePermission,
+    InventoryInventorySourcesUpdatePermission,
+    UserPermission,
+    InstanceGroupTowerPermission,
+)
 from awx.api.renderers import * # noqa
 from awx.api.serializers import * # noqa
 from awx.api.metadata import RoleMetadata, JobTypeMetadata
-from awx.main.models.unified_jobs import ACTIVE_STATES
+from awx.main.constants import ACTIVE_STATES
 from awx.main.scheduler.tasks import run_job_complete
+from awx.api.exceptions import ActiveJobConflict
 
 logger = logging.getLogger('awx.api.views')
 
@@ -145,6 +152,16 @@ class UnifiedJobDeletionMixin(object):
         # Still allow deletion of new status, because these can be manually created
         if obj.status in ACTIVE_STATES and obj.status != 'new':
             raise PermissionDenied(detail=_("Cannot delete running job resource."))
+        elif not obj.event_processing_finished:
+            # Prohibit deletion if job events are still coming in
+            if obj.finished and now() < obj.finished + dateutil.relativedelta.relativedelta(minutes=1):
+                # less than 1 minute has passed since job finished and events are not in
+                return Response({"error": _("Job has not finished processing events.")},
+                                status=status.HTTP_400_BAD_REQUEST)
+            else:
+                # if it has been > 1 minute, events are probably lost
+                logger.warning('Allowing deletion of {} through the API without all events '
+                               'processed.'.format(obj.log_format))
         obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -184,6 +201,21 @@ class InstanceGroupMembershipMixin(object):
         return response
 
 
+class RelatedJobsPreventDeleteMixin(object):
+    def perform_destroy(self, obj):
+        active_jobs = obj.get_active_jobs()
+        if len(active_jobs) > 0:
+            raise ActiveJobConflict(active_jobs)
+        time_cutoff = now() - dateutil.relativedelta.relativedelta(minutes=1)
+        recent_jobs = obj._get_related_jobs().filter(finished__gte = time_cutoff)
+        for unified_job in recent_jobs.get_real_instances():
+            if not unified_job.event_processing_finished:
+                raise PermissionDenied(_(
+                    'Related job {} is still processing events.'
+                ).format(unified_job.log_format))
+        return super(RelatedJobsPreventDeleteMixin, self).perform_destroy(obj)
+
+
 class ApiRootView(APIView):
 
     permission_classes = (AllowAny,)
@@ -211,8 +243,9 @@ class ApiRootView(APIView):
 class ApiOAuthAuthorizationRootView(APIView):
 
     permission_classes = (AllowAny,)
-    view_name = _("API OAuth Authorization Root")
+    view_name = _("API OAuth 2 Authorization Root")
     versioning_class = None
+    swagger_topic = 'Authentication'
 
     def get(self, request, format=None):
         data = OrderedDict()
@@ -626,11 +659,13 @@ class InstanceGroupList(ListCreateAPIView):
     serializer_class = InstanceGroupSerializer
 
 
-class InstanceGroupDetail(RetrieveUpdateDestroyAPIView):
+class InstanceGroupDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
 
+    always_allow_superuser = False
     view_name = _("Instance Group Detail")
     model = InstanceGroup
     serializer_class = InstanceGroupSerializer
+    permission_classes = (InstanceGroupTowerPermission,)
 
 
 class InstanceGroupUnifiedJobsList(SubListAPIView):
@@ -911,7 +946,7 @@ class OrganizationList(OrganizationCountsMixin, ListCreateAPIView):
         return super(OrganizationList, self).create(request, *args, **kwargs)
 
 
-class OrganizationDetail(RetrieveUpdateDestroyAPIView):
+class OrganizationDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
 
     model = Organization
     serializer_class = OrganizationSerializer
@@ -1205,7 +1240,6 @@ class ProjectList(ListCreateAPIView):
 
     model = Project
     serializer_class = ProjectSerializer
-    capabilities_prefetch = ['admin', 'update']
 
     def get_queryset(self):
         projects_qs = Project.accessible_objects(self.request.user, 'read_role')
@@ -1220,19 +1254,10 @@ class ProjectList(ListCreateAPIView):
         return projects_qs
 
 
-class ProjectDetail(RetrieveUpdateDestroyAPIView):
+class ProjectDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
 
     model = Project
     serializer_class = ProjectSerializer
-
-    def destroy(self, request, *args, **kwargs):
-        obj = self.get_object()
-        can_delete = request.user.can_access(Project, 'delete', obj)
-        if not can_delete:
-            raise PermissionDenied(_("Cannot delete project."))
-        for pu in obj.project_updates.filter(status__in=['new', 'pending', 'waiting', 'running']):
-            pu.cancel()
-        return super(ProjectDetail, self).destroy(request, *args, **kwargs)
 
 
 class ProjectPlaybooks(RetrieveAPIView):
@@ -1499,29 +1524,32 @@ class UserMeList(ListAPIView):
 
 class OAuth2ApplicationList(ListCreateAPIView):
 
-    view_name = _("OAuth Applications")
+    view_name = _("OAuth 2 Applications")
 
     model = OAuth2Application
     serializer_class = OAuth2ApplicationSerializer
+    swagger_topic = 'Authentication'
 
 
 class OAuth2ApplicationDetail(RetrieveUpdateDestroyAPIView):
 
-    view_name = _("OAuth Application Detail")
+    view_name = _("OAuth 2 Application Detail")
 
     model = OAuth2Application
     serializer_class = OAuth2ApplicationSerializer
+    swagger_topic = 'Authentication'
 
 
 class ApplicationOAuth2TokenList(SubListCreateAPIView):
 
-    view_name = _("OAuth Application Tokens")
+    view_name = _("OAuth 2 Application Tokens")
 
     model = OAuth2AccessToken
     serializer_class = OAuth2TokenSerializer
     parent_model = OAuth2Application
     relationship = 'oauth2accesstoken_set'
     parent_key = 'application'
+    swagger_topic = 'Authentication'
 
 
 class OAuth2ApplicationActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -1530,6 +1558,7 @@ class OAuth2ApplicationActivityStreamList(ActivityStreamEnforcementMixin, SubLis
     serializer_class = ActivityStreamSerializer
     parent_model = OAuth2Application
     relationship = 'activitystream_set'
+    swagger_topic = 'Authentication'
 
 
 class OAuth2TokenList(ListCreateAPIView):
@@ -1538,6 +1567,7 @@ class OAuth2TokenList(ListCreateAPIView):
 
     model = OAuth2AccessToken
     serializer_class = OAuth2TokenSerializer
+    swagger_topic = 'Authentication'
     
     
 class OAuth2AuthorizedTokenList(SubListCreateAPIView):
@@ -1549,6 +1579,7 @@ class OAuth2AuthorizedTokenList(SubListCreateAPIView):
     parent_model = OAuth2Application
     relationship = 'oauth2accesstoken_set'
     parent_key = 'application'
+    swagger_topic = 'Authentication'
 
     def get_queryset(self):
         return get_access_token_model().objects.filter(application__isnull=False, user=self.request.user)
@@ -1563,6 +1594,7 @@ class UserAuthorizedTokenList(SubListCreateAPIView):
     parent_model = User
     relationship = 'oauth2accesstoken_set'
     parent_key = 'user'
+    swagger_topic = 'Authentication'
 
     def get_queryset(self):
         return get_access_token_model().objects.filter(application__isnull=False, user=self.request.user)
@@ -1577,6 +1609,7 @@ class OAuth2PersonalTokenList(SubListCreateAPIView):
     parent_model = User
     relationship = 'main_oauth2accesstoken'
     parent_key = 'user'
+    swagger_topic = 'Authentication'
     
     def get_queryset(self):
         return get_access_token_model().objects.filter(application__isnull=True, user=self.request.user)
@@ -1587,7 +1620,8 @@ class OAuth2TokenDetail(RetrieveUpdateDestroyAPIView):
     view_name = _("OAuth Token Detail")
 
     model = OAuth2AccessToken
-    serializer_class = OAuth2TokenSerializer
+    serializer_class = OAuth2TokenDetailSerializer
+    swagger_topic = 'Authentication'
 
 
 class OAuth2TokenActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
@@ -1596,6 +1630,7 @@ class OAuth2TokenActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIVi
     serializer_class = ActivityStreamSerializer
     parent_model = OAuth2AccessToken
     relationship = 'activitystream_set'
+    swagger_topic = 'Authentication'
 
 
 class UserTeamsList(ListAPIView):
@@ -1814,7 +1849,6 @@ class CredentialList(CredentialViewMixin, ListCreateAPIView):
 
     model = Credential
     serializer_class = CredentialSerializerCreate
-    capabilities_prefetch = ['admin', 'use']
     filter_backends = ListCreateAPIView.filter_backends + [V1CredentialFilterBackend]
 
 
@@ -1981,7 +2015,6 @@ class InventoryList(ListCreateAPIView):
 
     model = Inventory
     serializer_class = InventorySerializer
-    capabilities_prefetch = ['admin', 'adhoc']
 
     def get_queryset(self):
         qs = Inventory.accessible_objects(self.request.user, 'read_role')
@@ -2020,7 +2053,7 @@ class ControlledByScmMixin(object):
         return obj
 
 
-class InventoryDetail(ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
+class InventoryDetail(RelatedJobsPreventDeleteMixin, ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
 
     model = Inventory
     serializer_class = InventoryDetailSerializer
@@ -2120,7 +2153,6 @@ class HostList(HostRelatedSearchMixin, ListCreateAPIView):
     always_allow_superuser = False
     model = Host
     serializer_class = HostSerializer
-    capabilities_prefetch = ['inventory.admin']
 
     def get_queryset(self):
         qs = super(HostList, self).get_queryset()
@@ -2157,7 +2189,6 @@ class InventoryHostsList(HostRelatedSearchMixin, SubListCreateAttachDetachAPIVie
     parent_model = Inventory
     relationship = 'hosts'
     parent_key = 'inventory'
-    capabilities_prefetch = ['inventory.admin']
 
     def get_queryset(self):
         inventory = self.get_parent_object()
@@ -2334,7 +2365,6 @@ class GroupList(ListCreateAPIView):
 
     model = Group
     serializer_class = GroupSerializer
-    capabilities_prefetch = ['inventory.admin', 'inventory.adhoc']
 
 
 class EnforceParentRelationshipMixin(object):
@@ -2421,7 +2451,6 @@ class GroupHostsList(HostRelatedSearchMixin,
     serializer_class = HostSerializer
     parent_model = Group
     relationship = 'hosts'
-    capabilities_prefetch = ['inventory.admin']
 
     def update_raw_data(self, data):
         data.pop('inventory', None)
@@ -2448,7 +2477,6 @@ class GroupAllHostsList(HostRelatedSearchMixin, SubListAPIView):
     serializer_class = HostSerializer
     parent_model = Group
     relationship = 'hosts'
-    capabilities_prefetch = ['inventory.admin']
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -2480,7 +2508,7 @@ class GroupActivityStreamList(ActivityStreamEnforcementMixin, SubListAPIView):
         return qs.filter(Q(group=parent) | Q(host__in=parent.hosts.all()))
 
 
-class GroupDetail(ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
+class GroupDetail(RelatedJobsPreventDeleteMixin, ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
 
     model = Group
     serializer_class = GroupSerializer
@@ -2680,19 +2708,10 @@ class InventorySourceList(ListCreateAPIView):
         return methods
 
 
-class InventorySourceDetail(RetrieveUpdateDestroyAPIView):
+class InventorySourceDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
 
     model = InventorySource
     serializer_class = InventorySourceSerializer
-
-    def destroy(self, request, *args, **kwargs):
-        obj = self.get_object()
-        can_delete = request.user.can_access(InventorySource, 'delete', obj)
-        if not can_delete:
-            raise PermissionDenied(_("Cannot delete inventory source."))
-        for pu in obj.inventory_updates.filter(status__in=['new', 'pending', 'waiting', 'running']):
-            pu.cancel()
-        return super(InventorySourceDetail, self).destroy(request, *args, **kwargs)
 
 
 class InventorySourceSchedulesList(SubListCreateAPIView):
@@ -2747,7 +2766,6 @@ class InventorySourceHostsList(HostRelatedSearchMixin, SubListDestroyAPIView):
     parent_model = InventorySource
     relationship = 'hosts'
     check_sub_obj_permission = False
-    capabilities_prefetch = ['inventory.admin']
 
 
 class InventorySourceGroupsList(SubListDestroyAPIView):
@@ -2860,10 +2878,6 @@ class JobTemplateList(ListCreateAPIView):
     metadata_class = JobTypeMetadata
     serializer_class = JobTemplateSerializer
     always_allow_superuser = False
-    capabilities_prefetch = [
-        'admin', 'execute',
-        {'copy': ['project.use', 'inventory.use']}
-    ]
 
     def post(self, request, *args, **kwargs):
         ret = super(JobTemplateList, self).post(request, *args, **kwargs)
@@ -2873,7 +2887,7 @@ class JobTemplateList(ListCreateAPIView):
         return ret
 
 
-class JobTemplateDetail(RetrieveUpdateDestroyAPIView):
+class JobTemplateDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
 
     model = JobTemplate
     metadata_class = JobTypeMetadata
@@ -3428,6 +3442,7 @@ class JobTemplateCallback(GenericAPIView):
         result = job.signal_start(inventory_sources_already_updated=inventory_sources_already_updated)
         if not result:
             data = dict(msg=_('Error starting job!'))
+            job.delete()
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
 
         # Return the location of the new job.
@@ -3620,7 +3635,7 @@ class WorkflowJobTemplateList(WorkflowsEnforcementMixin, ListCreateAPIView):
     always_allow_superuser = False
 
 
-class WorkflowJobTemplateDetail(WorkflowsEnforcementMixin, RetrieveUpdateDestroyAPIView):
+class WorkflowJobTemplateDetail(RelatedJobsPreventDeleteMixin, WorkflowsEnforcementMixin, RetrieveUpdateDestroyAPIView):
 
     model = WorkflowJobTemplate
     serializer_class = WorkflowJobTemplateSerializer
@@ -4094,6 +4109,22 @@ class JobRelaunch(RetrieveAPIView):
     obj_permission_type = 'start'
     serializer_class = JobRelaunchSerializer
 
+    def update_raw_data(self, data):
+        data = super(JobRelaunch, self).update_raw_data(data)
+        try:
+            obj = self.get_object()
+        except PermissionDenied:
+            return data
+        if obj:
+            needed_passwords = obj.passwords_needed_to_start
+            if needed_passwords:
+                data['credential_passwords'] = {}
+                for p in needed_passwords:
+                    data['credential_passwords'][p] = u''
+            else:
+                data.pop('credential_passwords')
+        return data
+
     @csrf_exempt
     @transaction.non_atomic_requests
     def dispatch(self, *args, **kwargs):
@@ -4108,15 +4139,22 @@ class JobRelaunch(RetrieveAPIView):
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
+        context = self.get_serializer_context()
+
+        modified_data = request.data.copy()
+        modified_data.setdefault('credential_passwords', {})
+        for password in obj.passwords_needed_to_start:
+            if password in modified_data:
+                modified_data['credential_passwords'][password] = modified_data[password]
 
         # Note: is_valid() may modify request.data
         # It will remove any key/value pair who's key is not in the 'passwords_needed_to_start' list
-        serializer = self.serializer_class(data=request.data, context={'obj': obj, 'data': request.data})
+        serializer = self.serializer_class(data=modified_data, context=context, instance=obj)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         copy_kwargs = {}
-        retry_hosts = request.data.get('hosts', None)
+        retry_hosts = serializer.validated_data.get('hosts', None)
         if retry_hosts and retry_hosts != 'all':
             if obj.status in ACTIVE_STATES:
                 return Response({'hosts': _(
@@ -4135,12 +4173,13 @@ class JobRelaunch(RetrieveAPIView):
             copy_kwargs['limit'] = ','.join(retry_host_list)
 
         new_job = obj.copy_unified_job(**copy_kwargs)
-        result = new_job.signal_start(**request.data)
+        result = new_job.signal_start(**serializer.validated_data['credential_passwords'])
         if not result:
-            data = dict(passwords_needed_to_start=new_job.passwords_needed_to_start)
+            data = dict(msg=_('Error starting job!'))
+            new_job.delete()
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
         else:
-            data = JobSerializer(new_job, context=self.get_serializer_context()).data
+            data = JobSerializer(new_job, context=context).data
             # Add job key to match what old relaunch returned.
             data['job'] = new_job.id
             headers = {'Location': new_job.get_absolute_url(request=request)}
@@ -4276,7 +4315,6 @@ class JobEventHostsList(HostRelatedSearchMixin, SubListAPIView):
     parent_model = JobEvent
     relationship = 'hosts'
     view_name = _('Job Event Hosts List')
-    capabilities_prefetch = ['inventory.admin']
 
 
 class BaseJobEventsList(SubListAPIView):
@@ -4374,6 +4412,7 @@ class AdHocCommandList(ListCreateAPIView):
         result = ad_hoc_command.signal_start(**request.data)
         if not result:
             data = dict(passwords_needed_to_start=ad_hoc_command.passwords_needed_to_start)
+            ad_hoc_command.delete()
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
         return response
 
@@ -4466,6 +4505,7 @@ class AdHocCommandRelaunch(GenericAPIView):
         result = new_ad_hoc_command.signal_start(**request.data)
         if not result:
             data = dict(passwords_needed_to_start=new_ad_hoc_command.passwords_needed_to_start)
+            new_ad_hoc_command.delete()
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
         else:
             data = AdHocCommandSerializer(new_ad_hoc_command, context=self.get_serializer_context()).data
@@ -4570,11 +4610,6 @@ class UnifiedJobTemplateList(ListAPIView):
 
     model = UnifiedJobTemplate
     serializer_class = UnifiedJobTemplateSerializer
-    capabilities_prefetch = [
-        'admin', 'execute',
-        {'copy': ['jobtemplate.project.use', 'jobtemplate.inventory.use',
-                  'workflowjobtemplate.organization.workflow_admin']}
-    ]
 
 
 class UnifiedJobList(ListAPIView):
@@ -4676,7 +4711,7 @@ class UnifiedJobStdout(RetrieveAPIView):
         except StdoutMaxBytesExceeded as e:
             response_message = _(
                 "Standard Output too large to display ({text_size} bytes), "
-                "only download supported for sizes over {supported_size} bytes").format(
+                "only download supported for sizes over {supported_size} bytes.").format(
                     text_size=e.total, supported_size=e.supported
             )
             if request.accepted_renderer.format == 'json':

@@ -21,6 +21,7 @@ from awx.main.models.jobs import Job
 from awx.main.models.projects import ProjectUpdate
 from awx.main.models.unified_jobs import UnifiedJob
 from awx.main.utils import get_cpu_capacity, get_mem_capacity, get_system_task_capacity
+from awx.main.models.mixins import RelatedJobsMixin
 
 __all__ = ('Instance', 'InstanceGroup', 'JobOrigin', 'TowerScheduleState',)
 
@@ -110,7 +111,7 @@ class Instance(models.Model):
 
     
 
-class InstanceGroup(models.Model):
+class InstanceGroup(models.Model, RelatedJobsMixin):
     """A model representing a Queue/Group of AWX Instances."""
     objects = InstanceGroupManager()
 
@@ -151,6 +152,13 @@ class InstanceGroup(models.Model):
     @property
     def capacity(self):
         return sum([inst.capacity for inst in self.instances.all()])
+
+    '''
+    RelatedJobsMixin
+    '''
+    def _get_related_jobs(self):
+        return UnifiedJob.objects.filter(instance_group=self)
+
 
     class Meta:
         app_label = 'main'

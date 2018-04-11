@@ -1,0 +1,127 @@
+---
+- fail:
+    msg: "Only set one of kubernetes_context or openshift_host"
+  when: openshift_host is defined and kubernetes_context is defined
+
+- name: Set kubernetes base path
+  set_fact:
+    kubernetes_base_path: "{{ awx_local_base_config_path|default('/tmp') }}/awx-config"
+
+- include_tasks: openshift.yml
+  when: openshift_host is defined
+
+- include_tasks: kubernetes.yml
+  when: kubernetes_context is defined
+
+- name: Use kubectl or oc
+  set_fact:
+    kubectl_or_oc: "{{ openshift_oc_bin if openshift_oc_bin is defined else 'kubectl' }}"
+
+- name: Get Postgres Service Detail
+  shell: "{{ kubectl_or_oc }} describe svc {{ postgresql_service_name }} -n {{ awx_kubernetes_namespace }}"
+  register: postgres_svc_details
+  ignore_errors: yes
+  when: "pg_hostname is not defined or pg_hostname == ''"
+
+- name: Manage AWX Container Images
+  include_role:
+    name: image_push
+  when: dockerhub_base is not defined
+
+- name: Set image names
+  block:
+    - name: Enable image stream lookups for awx images
+      shell: "{{ openshift_oc_bin }} set image-lookup --all -n {{ awx_kubernetes_namespace }}"
+      when: openshift_host is defined
+
+    - name: Set full web image path
+      set_fact:
+        awx_web_kubernetes_image: "{{ awx_web_image }}:{{ awx_version }}"
+      when: awx_web_kubernetes_image is not defined
+
+    - name: Set full task image path
+      set_fact:
+        awx_task_kubernetes_image: "{{ awx_task_image }}:{{ awx_version }}"
+      when: awx_task_kubernetes_image is not defined
+  when: dockerhub_base is not defined
+
+- name: Set DockerHub Image Paths
+  set_fact:
+    awx_web_kubernetes_image: "{{ dockerhub_base }}/awx_web:{{ dockerhub_version }}"
+    awx_task_kubernetes_image: "{{ dockerhub_base }}/awx_task:{{ dockerhub_version }}"
+  when: dockerhub_base is defined
+
+- name: Deploy PostgreSQL (OpenShift)
+  block:
+    - name: Template PostgreSQL Deployment
+      template:
+        src: postgresql-persistent.yml.j2
+        dest: "{{ kubernetes_base_path }}/postgresql-persistent.yml"
+        mode: '0600'
+
+    - name: Deploy and Activate Postgres
+      shell: |
+        {{ openshift_oc_bin }} new-app --file={{ kubernetes_base_path }}/postgresql-persistent.yml \
+          -e MEMORY_LIMIT={{ pg_memory_limit|default('512') }}Mi \
+          -e DATABASE_SERVICE_NAME=postgresql  \
+          -e POSTGRESQL_MAX_CONNECTIONS={{ pg_max_connections|default(1024) }} \
+          -e POSTGRESQL_USER={{ pg_username }} \
+          -e POSTGRESQL_PASSWORD={{ pg_password }} \
+          -e POSTGRESQL_DATABASE={{ pg_database }} \
+          -e POSTGRESQL_VERSION=9.5 \
+          -n {{ awx_kubernetes_namespace }}
+      register: openshift_pg_activate
+  when:
+    - pg_hostname is not defined or pg_hostname == ''
+    - postgres_svc_details is defined and postgres_svc_details.rc != 0
+    - openshift_host is defined
+
+- name: Deploy and Activate Postgres (Kubernetes)
+  shell: |
+    helm install --name awx --namespace {{ awx_kubernetes_namespace }} \
+      --set postgresUser={{ pg_username }} \
+      --set postgresPassword={{ pg_password }} \
+      --set postgresDatabase={{ pg_database }} \
+      --set persistence.size={{ pg_volume_capacity|default('5')}}Gi \
+      stable/postgresql
+  when:
+    - pg_hostname is not defined or pg_hostname == ''
+    - postgres_svc_details is defined and postgres_svc_details.rc != 0
+    - kubernetes_context is defined
+  register: kubernetes_pg_activate
+
+- name: Set postgresql hostname to helm package service
+  set_fact:
+    pg_hostname: awx-postgresql
+  when:
+    - pg_hostname is not defined or pg_hostname == ''
+    - kubernetes_context is defined
+
+- name: Wait for Postgres to activate
+  pause:
+    seconds: 60
+  when: openshift_pg_activate.changed or kubernetes_pg_activate.changed
+
+- name: Ensure directory exists
+  file:
+    path: "{{ kubernetes_base_path }}"
+    state: directory
+
+
+- name: Template Kubernetes AWX Config
+  template:
+    src: configmap.yml.j2
+    dest: "{{ kubernetes_base_path }}/configmap.yml"
+    mode: '0600'
+
+- name: Template Kubernetes AWX Deployment
+  template:
+    src: deployment.yml.j2
+    dest: "{{ kubernetes_base_path }}/deployment.yml"
+    mode: '0600'
+
+- name: Apply Configmap
+  shell: "{{ kubectl_or_oc }} apply -f {{ kubernetes_base_path }}/configmap.yml"
+
+- name: Apply Deployment
+  shell: "{{ kubectl_or_oc }} apply -f {{ kubernetes_base_path }}/deployment.yml"

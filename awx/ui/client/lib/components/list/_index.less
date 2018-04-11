@@ -72,12 +72,40 @@
     justify-content: space-between;
     align-items: center;
     padding: @at-padding-list-row;
+    position: relative;
 }
 
 .at-Row--active {
     border-left: @at-border-style-list-active-indicator;
     border-top-left-radius: @at-border-radius;
     border-top-right-radius: @at-border-radius;
+}
+
+.at-Row--active .at-Row--invalid {
+    border-left: @at-white solid 1px;
+}
+
+.at-Row--invalid {
+    align-items: center;
+    background: @at-color-error;
+    display: flex;
+    height: 100%;
+    justify-content: center;
+    left: 0;
+    position: absolute;
+    width: @at-space-2x;
+
+    .at-Popover {
+        padding: 0;
+
+        &-icon i {
+            color: @at-white;
+        }
+
+        &-icon i:hover {
+            color: @at-white;
+        }
+    }
 }
 
 .at-Row ~ .at-Row {
@@ -121,6 +149,10 @@
     display: flex;
     align-items: center;
     line-height: @at-height-list-row-item;
+}
+
+.at-RowItem-status {
+    margin-right: @at-margin-right-list-row-item-status;
 }
 
 .at-RowItem--isHeader {
@@ -235,6 +267,16 @@
     margin: 2px 20px 0 0;
 }
 
+.at-RowItem--inline {
+    display: inline-flex;
+    margin-right: @at-margin-right-list-row-item-inline;
+
+    .at-RowItem-label {
+        width: auto;
+        margin-right: @at-margin-right-list-row-item-inline-label;
+    }
+}
+
 @media screen and (max-width: @at-breakpoint-compact-list) {
     .at-Row-actions {
         flex-direction: column;
@@ -242,5 +284,15 @@
 
     .at-RowAction {
         margin: @at-margin-list-row-action-mobile;
+    }
+
+    .at-RowItem--inline {
+        display: flex;
+        margin-right: inherit;
+
+        .at-RowItem-label {
+            width: @at-width-list-row-item-label;
+            margin-right: inherit;
+        }
     }
 }

@@ -194,6 +194,9 @@ angular.module('GeneratorHelpers', [systemStatus.name])
             case 'insights':
                 icon = "fa-info";
                 break;
+            case 'network':
+                icon = "fa-sitemap";
+                break;
             case 'cancel':
                 icon = "fa-minus-circle";
                 break;
@@ -549,6 +552,11 @@ angular.module('GeneratorHelpers', [systemStatus.name])
                 html += "ng-show='!" + list.iterator + "." ;
                 html += (field.flag) ? field.flag : "enabled";
                 html += "' class='ScheduleToggle-switch' ng-click='" + field.ngClick + "'>" + i18n._("OFF") + "</button></div></td>";
+            } else if (field.type === 'invalid') {
+                html += `<td class='List-tableRow--invalid'><div class='List-tableRow--invalidBar' ng-show="${field.ngShow}"`;
+                html += `aw-tool-tip="${field.awToolTip}" data-placement=${field.dataPlacement}>`;
+                html += "<i class='fa fa-exclamation'></i>";
+                html += "</div></td>";
             } else {
                 html += "<td class=\"List-tableCell " + fld + "-column";
                 html += (field['class']) ? " " + field['class'] : "";
@@ -560,7 +568,13 @@ angular.module('GeneratorHelpers', [systemStatus.name])
                 }
                 html += "\" ";
                 html += field.columnNgClass ? " ng-class=\"" + field.columnNgClass + "\"": "";
-                html += (options.mode === 'lookup' || options.mode === 'select') ? " ng-click=\"toggle_row(" + list.iterator + ")\"" : "";
+                if(options.mode === 'lookup' || options.mode === 'select') {
+                    if (options.input_type === "radio") {
+                        html += " ng-click=\"toggle_row(" + list.iterator + ")\"";
+                    } else {
+                        html += " ng-click=\"toggle_" + list.iterator + "(" + list.iterator + ", true)\"";
+                    }
+                }
                 html += (field.columnShow) ? Attr(field, 'columnShow') : "";
                 html += (field.ngBindHtml) ? "ng-bind-html=\"" + field.ngBindHtml + "\" " : "";
                 html += (field.columnClick) ? "ng-click=\"" + field.columnClick + "\" " : "";

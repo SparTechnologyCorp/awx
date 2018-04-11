@@ -23,6 +23,7 @@ This document provides a guide for installing AWX.
 - [Kubernetes](#kubernetes)
   - [Prerequisites](#prerequisites-2)
   - [Pre-build steps](#pre-build-steps-1)
+  - [Configuring Helm](#configuring-helm)
   - [Start the build](#start-the-build-1)
   - [Accessing AWX](#accessing-awx-1)
   - [SSL Termination](#ssl-termination)
@@ -70,6 +71,7 @@ The system that runs the AWX service will need to satisfy the following requirem
 - At least 2 cpu cores
 - At least 20GB of space
 - Running Docker, Openshift, or Kubernetes
+- If you choose to use an external PostgreSQL database, please note that the minimum version is 9.4.
 
 ### AWX Tunables
 
@@ -114,6 +116,15 @@ If these variables are present then all deployments will use these hosted images
 To complete a deployment to OpenShift, you will obviously need access to an OpenShift cluster. For demo and testing purposes, you can use [Minishift](https://github.com/minishift/minishift) to create a single node cluster running inside a virtual machine.
 
 You will also need to have the `oc` command in your PATH. The `install.yml` playbook will call out to `oc` when logging into, and creating objects on the cluster.
+
+The default resource requests per-pod requires:
+
+> Memory: 6GB
+> CPU: 3 cores
+
+This can be tuned by overriding the variables found in [/installer/openshift/defaults/main.yml](/installer/openshift/defaults/main.yml). Special care should be taken when doing this as undersized instances will experience crashes and resource exhaustion.
+
+For more detail on how resource requests are formed see: [https://docs.openshift.com/container-platform/latest/dev_guide/compute_resources.html#dev-compute-resources](https://docs.openshift.com/container-platform/latest/dev_guide/compute_resources.html#dev-compute-resources)
 
 #### Deploying to Minishift
 
@@ -287,6 +298,15 @@ A Kubernetes deployment will require you to have access to a Kubernetes cluster 
 
 The installation program will reference `kubectl` directly. `helm` is only necessary if you are letting the installer configure PostgreSQL for you.
 
+The default resource requests per-pod requires:
+
+> Memory: 6GB
+> CPU: 3 cores
+
+This can be tuned by overriding the variables found in [/installer/kubernetes/defaults/main.yml](/installer/kubernetes[/defaults/main.yml). Special care should be taken when doing this as undersized instances will experience crashes and resource exhaustion.
+
+For more detail on how resource requests are formed see: [https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/](https://kubernetes.io/docs/concepts/configuration/manage-compute-resources-container/)
+
 ### Pre-build steps
 
 Before starting the build process, review the [inventory](./installer/inventory) file, and uncomment and provide values for the following variables found in the `[all:vars]` section uncommenting when necessary. Make sure the openshift and standalone docker sections are commented out:
@@ -302,6 +322,12 @@ Before starting the build process, review the [inventory](./installer/inventory)
 *docker_registry_*
 
 > These settings should be used if building your own base images. You'll need access to an external registry and are responsible for making sure your kube cluster can talk to it and use it. If these are undefined and the dockerhub_ configuration settings are uncommented then the images will be pulled from dockerhub instead
+
+### Configuring Helm
+
+If you want the AWX installer to manage creating the database pod (rather than installing and configuring postgres on your own). Then you will need to have a working `helm` installation, you can find details here: [https://docs.helm.sh/using_helm/#quickstart-guide](https://docs.helm.sh/using_helm/#quickstart-guide).
+
+Newer Kubernetes clusters with RBAC enabled will need to make sure a service account is created, make sure to follow the instructions here [https://docs.helm.sh/using_helm/#role-based-access-control](https://docs.helm.sh/using_helm/#role-based-access-control)
 
 ### Start the build
 

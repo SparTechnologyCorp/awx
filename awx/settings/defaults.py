@@ -5,6 +5,7 @@ import os
 import re  # noqa
 import sys
 import ldap
+import djcelery
 from datetime import timedelta
 
 from kombu import Queue, Exchange
@@ -238,6 +239,7 @@ TEMPLATES = [
 ]
 
 MIDDLEWARE_CLASSES = (  # NOQA
+    'awx.main.middleware.MigrationRanCheckMiddleware',
     'awx.main.middleware.TimingMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.locale.LocaleMiddleware',
@@ -266,7 +268,7 @@ INSTALLED_APPS = (
     'oauth2_provider',
     'rest_framework',
     'django_extensions',
-    'django_celery_results',
+    'djcelery',
     'channels',
     'polymorphic',
     'taggit',
@@ -277,6 +279,7 @@ INSTALLED_APPS = (
     'awx.ui',
     'awx.sso',
     'solo',
+    'awx.network_ui'
 )
 
 INTERNAL_IPS = ('127.0.0.1',)
@@ -337,9 +340,9 @@ AUTHENTICATION_BACKENDS = (
 # Django OAuth Toolkit settings
 OAUTH2_PROVIDER_APPLICATION_MODEL = 'main.OAuth2Application'
 OAUTH2_PROVIDER_ACCESS_TOKEN_MODEL = 'main.OAuth2AccessToken'
-OAUTH2_PROVIDER_REFRESH_TOKEN_MODEL = 'main.OAuth2RefreshToken'
 
-OAUTH2_PROVIDER = {}
+OAUTH2_PROVIDER = {'ACCESS_TOKEN_EXPIRE_SECONDS': 31536000000,
+                   'AUTHORIZATION_CODE_EXPIRE_SECONDS': 600}
 
 # LDAP server (default to None to skip using LDAP authentication).
 # Note: This setting may be overridden by database settings.
@@ -366,15 +369,6 @@ TACACSPLUS_PORT = 49
 TACACSPLUS_SECRET = ''
 TACACSPLUS_SESSION_TIMEOUT = 5
 TACACSPLUS_AUTH_PROTOCOL = 'ascii'
-
-# Seconds before auth tokens expire.
-# Note: This setting may be overridden by database settings.
-AUTH_TOKEN_EXPIRATION = 1800
-
-# Maximum number of per-user valid, concurrent tokens.
-# -1 is unlimited
-# Note: This setting may be overridden by database settings.
-AUTH_TOKEN_PER_USER = -1
 
 # Enable / Disable HTTP Basic Authentication used in the API browser
 # Note: Session limits are not enforced when using HTTP Basic Authentication.
@@ -452,28 +446,31 @@ DEVSERVER_DEFAULT_PORT = '8013'
 # Set default ports for live server tests.
 os.environ.setdefault('DJANGO_LIVE_TEST_SERVER_ADDRESS', 'localhost:9013-9199')
 
+djcelery.setup_loader()
+
 BROKER_POOL_LIMIT = None
-CELERY_BROKER_URL = 'amqp://guest:guest@localhost:5672//'
+BROKER_URL = 'amqp://guest:guest@localhost:5672//'
 CELERY_EVENT_QUEUE_TTL = 5
-CELERY_TASK_DEFAULT_QUEUE = 'tower'
+CELERY_DEFAULT_QUEUE = 'tower'
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_TRACK_STARTED = True
-CELERY_TASK_TIME_LIMIT = None
-CELERY_TASK_SOFT_TIME_LIMIT = None
-CELERY_WORKER_POOL_RESTARTS = True
-CELERY_BEAT_SCHEDULER = 'celery.beat.PersistentScheduler'
-CELERY_BEAT_MAX_LOOP_INTERVAL = 60
-CELERY_RESULT_BACKEND = 'django-db'
+CELERY_TRACK_STARTED = True
+CELERYD_TASK_TIME_LIMIT = None
+CELERYD_TASK_SOFT_TIME_LIMIT = None
+CELERYD_POOL_RESTARTS = True
+CELERYD_AUTOSCALER = 'awx.main.utils.autoscale:DynamicAutoScaler'
+CELERY_RESULT_BACKEND = 'djcelery.backends.database:DatabaseBackend'
 CELERY_IMPORTS = ('awx.main.scheduler.tasks',)
-CELERY_TASK_QUEUES = (
+CELERY_QUEUES = (
     Queue('tower', Exchange('tower'), routing_key='tower'),
     Broadcast('tower_broadcast_all')
 )
-CELERY_TASK_ROUTES = {}
+CELERY_ROUTES = {}
 
-CELERY_BEAT_SCHEDULE = {
+CELERYBEAT_SCHEDULER = 'celery.beat.PersistentScheduler'
+CELERYBEAT_MAX_LOOP_INTERVAL = 60
+CELERYBEAT_SCHEDULE = {
     'tower_scheduler': {
         'task': 'awx.main.tasks.awx_periodic_scheduler',
         'schedule': timedelta(seconds=30),
@@ -509,6 +506,11 @@ AWX_INCONSISTENT_TASK_INTERVAL = 60 * 3
 # Note: Broadcast queues have unique, auto-generated names, with the alias
 # property value of the original queue name.
 AWX_CELERY_QUEUES_STATIC = ['tower_broadcast_all',]
+
+ASGI_AMQP = {
+    'INIT_FUNC': 'awx.prepare_env',
+    'MODEL': 'awx.main.models.channels.ChannelGroup',
+}
 
 # Django Caching Configuration
 if is_testing():
@@ -885,8 +887,7 @@ SATELLITE6_GROUP_FILTER = r'^.+$'
 SATELLITE6_HOST_FILTER = r'^.+$'
 SATELLITE6_EXCLUDE_EMPTY_GROUPS = True
 SATELLITE6_INSTANCE_ID_VAR = 'foreman.id'
-SATELLITE6_GROUP_PREFIX = 'foreman_'
-SATELLITE6_GROUP_PATTERNS = ["{app}-{tier}-{color}", "{app}-{color}", "{app}", "{tier}"]
+# SATELLITE6_GROUP_PREFIX and SATELLITE6_GROUP_PATTERNS defined in source vars
 
 # ---------------------
 # ----- CloudForms -----
@@ -945,6 +946,7 @@ FACT_CACHE_PORT = 6564
 
 # Note: This setting may be overridden by database settings.
 ORG_ADMINS_CAN_SEE_ALL_USERS = True
+MANAGE_ORGANIZATION_AUTH = True
 
 # Note: This setting may be overridden by database settings.
 TOWER_ADMIN_ALERTS = True
